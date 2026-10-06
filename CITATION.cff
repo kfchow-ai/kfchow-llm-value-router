@@ -2,10 +2,10 @@ cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
 title: "kfchow-llm-value-router: Jev-driven per-turn model routing for Hermes Agent, resolved from the KFChow AI Lab value leaderboard"
 authors:
-  - alias: KFChow
+  - name: "KFChow AI Lab"
     email: hotline@kfchow.com
     website: "https://kfchow.com/llm"
-version: 1.0.0
+version: 1.0.3
 date-released: "2026-10-06"
 license: MIT
 repository-code: "https://github.com/kfchow-ai/kfchow-llm-value-router"
@@ -16,4 +16,4 @@ keywords:
   - cost-optimization
   - hermes-agent
   - value-leaderboard
-abstract: "A Hermes Agent llm_request middleware that classifies each turn (routine vs strategic) and routes it to the cheapest adequate model tier — downgrade to the provider's free rung or escalate to premium — with a fail-open contract, shadow-by-default rollout, credit-aware escalation that fails closed, and per-provider rungs derived from a live value leaderboard feed rather than hardcoded model ids."
+abstract: "A Hermes Agent llm_request middleware that classifies each turn (routine vs strategic) and routes it to the cheapest adequate model tier - downgrade to the provider's free rung or escalate to premium - with a fail-open contract, shadow-by-default rollout, credit-aware escalation that fails closed, and per-provider rungs derived from a live value leaderboard feed rather than hardcoded model ids."
