@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local runtime state (never commit)
+.env
+.env.*
+*.env
+
+# macOS
+.DS_Store

@@ -1,0 +1,114 @@
+{
+  "_meta": {
+    "what": "Golden request/response schema fixture for the TypeSafe System One (Jev) API, captured from official vendor docs before any client code was written.",
+    "captured": "2026-09-21",
+    "sources": [
+      "https://docs.typesafe.ai/api",
+      "https://docs.typesafe.ai/introduction/quickstart",
+      "https://docs.typesafe.ai/models",
+      "https://docs.typesafe.ai/agent-skill"
+    ],
+    "practitioner_errors_enforced": [
+      "One-question-per-call: independent questions over the same state are sent TOGETHER in one request (they run in parallel); batching is enforced in the client by chunked Choice questions over a shared catalog.",
+      "Invented request fields: the request body is exactly {state, model, questions}; each question is exactly {type, instructions, criteria} with criteria shape per type. Nothing else is sent."
+    ]
+  },
+  "request": {
+    "endpoint": "POST https://api.typesafe.ai/v1/systemone",
+    "auth_header": "Authorization: Bearer ***",
+    "content_type": "application/json",
+    "body": {
+      "state": "string | object | array (text only; no images/audio/video)",
+      "model": "string — 'jev-latest' (alias) or versioned ID e.g. 'jev-1.13.0'; versioned IDs are accepted whether or not listed by GET /v1/models",
+      "questions": "map<question_id, Question>; question_id chosen by caller, returned verbatim in answers; per docs the question id is not sent to the model"
+    },
+    "question_types": {
+      "noul": {
+        "fields": ["type", "instructions"],
+        "instructions": "string | object | array — the yes/no question",
+        "criteria": "optional object with 'true' and 'false' describing what yes/no mean"
+      },
+      "choice": {
+        "fields": ["type", "instructions", "criteria"],
+        "criteria": "map<option_key, string|object|array|null> — option rubric descriptions; MAXIMUM 255 OPTIONS PER CHOICE"
+      },
+      "score": {
+        "fields": ["type", "instructions", "criteria"],
+        "criteria": "ORDERED array of level descriptions; 2 to 10 levels"
+      }
+    },
+    "example_request": {
+      "state": "Help! My payouts have been failing for 3 days.",
+      "model": "jev-latest",
+      "questions": {
+        "department": {
+          "type": "choice",
+          "instructions": "Which team should handle this?",
+          "criteria": {
+            "billing": "Payments, invoicing, refunds",
+            "technical": "Bugs, outages, integrations",
+            "sales": "Pricing, upgrades, new accounts"
+          }
+        },
+        "is_urgent": {
+          "type": "noul",
+          "instructions": "Does this convey urgency?"
+        }
+      }
+    }
+  },
+  "response": {
+    "top_level_required": ["model", "answers", "usage"],
+    "model": "string — the VERSIONED id of the model that answered (e.g. 'jev-1.13.0'), even when an alias was sent",
+    "answers": "map<question_id, Answer> — one per question, keyed by the ids sent",
+    "usage": {"input_tokens": "integer", "output_tokens": "integer"},
+    "answer_types": {
+      "noul": {
+        "required": ["type", "noul"],
+        "noul": "number 0..1 — probability of yes; NO separate confidence field (docs: 'no separate confidence')"
+      },
+      "choice": {
+        "required": ["type", "choice", "probabilities", "confidence"],
+        "choice": "string — one of the option keys defined in criteria",
+        "probabilities": "map<option_key, number> — floats summing to 1",
+        "confidence": "number 0..1 derived from the distribution"
+      },
+      "score": {
+        "required": ["type", "score", "legend", "probabilities", "confidence"],
+        "score": "number — probability-weighted level; may land between integer levels",
+        "legend": "map<string_level_index, description>",
+        "probabilities": "map<string_level_index, number> summing to 1",
+        "confidence": "number 0..1"
+      }
+    },
+    "example_response": {
+      "model": "jev-1.13.0",
+      "answers": {
+        "department": {
+          "type": "choice",
+          "choice": "billing",
+          "probabilities": {"billing": 0.88, "technical": 0.12, "sales": 0.0},
+          "confidence": 0.81
+        },
+        "is_urgent": {"type": "noul", "noul": 0.95}
+      },
+      "usage": {"input_tokens": 318, "output_tokens": 34}
+    },
+    "forward_compat": "Unknown extra fields on responses are ignored (SDK docs); unknown answer kinds are skipped. The validator therefore checks required fields and rejects WRONG values but tolerates extra top-level/answer fields."
+  },
+  "errors": {
+    "401": "Unauthorized — missing or invalid API key (check Authorization header)",
+    "422": "Unprocessable Entity — request body failed validation; body details the offending field",
+    "429": "Too Many Requests — rate limit; back off and retry after a short delay",
+    "529": "Overloaded — retry after a short delay",
+    "retry_policy": "Docs: on 429/529 retry with exponential backoff. Client implements retry <=1 by default."
+  },
+  "limits": {
+    "choice_options_max": 255,
+    "score_levels": "2..10",
+    "context_length_per_request_tokens": 64000,
+    "state_max_tokens": 32000,
+    "rate_limit": "250,000 tokens per second / 1,200 requests per minute",
+    "pricing": "$0.042 per Mtok input, output free ($42/Btok)"
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "enabled": true,
+  "mode": "shadow",
+  "confidence_gate": 0.65,
+  "feed_url": "https://kfchow.com/llm-value-leaderboard/feed.xml",
+  "rungs_path": "~/.hermes/jev/llm_rungs.json",
+  "route_providers": ["nous"],
+  "route_models": ["z-ai/glm-5.3-flash", "glm-5.3-flash"],
+  "free_model": "",
+  "escalate_enabled": true,
+  "escalate_providers": ["nous"],
+  "escalate_models": ["z-ai/glm-5.3", "glm-5.3"],
+  "premium_model": "",
+  "escalate_confidence_gate": 0.65,
+  "credit_probe": true,
+  "send_excerpt": true,
+  "excerpt_chars": 1200,
+  "jev_timeout_s": 10,
+  "rungs": {
+    "nous": {
+      "free": "",
+      "mid": [],
+      "premium": "",
+      "note": "fill from scripts/llm-rank-resolver.py output (the KFChow value rule); a rewrite never crosses providers"
+    }
+  },
+  "_comment": "Example configuration. mode stays shadow until you deliberately flip it to live. Model ids here are ILLUSTRATIVE placeholders from the public leaderboard; resolve fresh rungs with scripts/llm-rank-resolver.py (free ids rotate and expire silently). Keys are read from the environment only: NOUS_API_KEY for the credit probe, JEVI_API_KEY for the vendor classifier."
+}

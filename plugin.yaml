@@ -1,0 +1,73 @@
+name: kfchow-llm-value-router
+version: "1.0.0"
+description: "Per-turn LLM model routing guided by the KFChow value leaderboard. On the first provider call of a turn, a vendor classifier decides free vs strong tier; in live mode it rewrites the request model. Fail-open, shadow-by-default."
+author: KFChow
+license: MIT
+requires_hermes: ">=0.21.5"
+provides_middleware:
+  - llm_request
+optional_env:
+  - NOUS_API_KEY
+  - JEVI_API_KEY
+config_schema:
+  enabled:
+    type: bool
+    default: true
+    description: "Master switch. When false the middleware returns None immediately."
+  mode:
+    type: str
+    default: shadow
+    description: "shadow = decide and log only; live = rewrite the request model. Stays shadow until a human flips it."
+  confidence_gate:
+    type: float
+    default: 0.65
+    description: "Minimum classifier confidence to rewrite the model (free tier)."
+  feed_url:
+    type: str
+    default: "https://kfchow.com/llm-value-leaderboard/feed.xml"
+    description: "KFChow value leaderboard feed (ranking lives in ITEM descriptions)."
+  rungs_path:
+    type: str
+    default: "~/.hermes/jev/llm_rungs.json"
+    description: "Where llm-rank-resolver.py writes the resolved rungs."
+  route_providers:
+    type: list
+    description: "Providers eligible for the free-tier downgrade path."
+  route_models:
+    type: list
+    description: "Model ids eligible for the free-tier downgrade path."
+  free_model:
+    type: str
+    description: "Flat free-tier fallback rung (per-provider rungs take precedence)."
+  escalate_enabled:
+    type: bool
+    default: true
+    description: "Enable the mid -> premium escalation path."
+  escalate_providers:
+    type: list
+    description: "Providers eligible for escalation (must match the turn's originating provider)."
+  escalate_models:
+    type: list
+    description: "Mid-rung model ids eligible for escalation."
+  premium_model:
+    type: str
+    description: "Flat premium fallback rung (per-provider rungs take precedence)."
+  escalate_confidence_gate:
+    type: float
+    description: "Escalation gate; falls back to confidence_gate when unset."
+  credit_probe:
+    type: bool
+    default: true
+    description: "Before escalating on a metered provider, probe the paid lane; fail-closed when dark."
+  send_excerpt:
+    type: bool
+    default: true
+    description: "Send a capped last-user-message excerpt to the vendor and include it in the local log. Set false to keep task text out of both (reduces accuracy)."
+  excerpt_chars:
+    type: int
+    default: 1200
+    description: "Cap for the task excerpt (last user message)."
+  jev_timeout_s:
+    type: float
+    default: 10
+    description: "Vendor classify timeout in seconds; on timeout the turn proceeds unchanged (fail-open)."
