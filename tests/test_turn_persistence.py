@@ -588,3 +588,312 @@ def test_exec_bookkeeping_failure_single_dispatch_returns_response(monkeypatch):
     out = pl.on_llm_execution(request=req, next_call=_next, **ctx)
     assert out == {"ok": True}
     assert calls == [req]  # one dispatch, untouched original payload
+
+
+# ===================== v1.0.6 — 4-TIER ladder (flash tier, 22-30) ============
+# Ladder per the approved tier table: premium = paid AND conf >= escalate
+# gate (0.80); free = free AND conf >= gate; flash (NEW) = free AND
+# flash_gate <= conf < gate; mid (stay) = everything else. One classify per
+# turn; flash NEVER probes credits; paid-pool turns never downgrade.
+
+def _cfg4(**over):
+    """4-tier ladder config: flash band [0.35, 0.65), escalation gate 0.80."""
+    base = {"enabled": True, "mode": "live", "confidence_gate": 0.65,
+            "route_providers": ["nous"],
+            "route_models": ["z-ai/glm-5.3-flash", "glm-5.3-flash"],
+            "free_model": "inclusionai/ling-3.0-flash-sante:free",
+            "flash_gate": 0.35,
+            "flash_model": "z-ai/glm-5.3-flash",
+            "escalate_enabled": True, "escalate_providers": ["nous"],
+            "escalate_models": ["z-ai/glm-5.3", "glm-5.3"],
+            "premium_model": "anthropic/claude-sonnet-5.5",
+            "escalate_confidence_gate": 0.80, "credit_probe": True,
+            "send_excerpt": True}
+    base.update(over)
+    return base
+
+
+def _kw_mid(turn_id="t1", session_id="s1", api_call_count=1, provider="nous",
+            model="z-ai/glm-5.3", messages=None):
+    """A turn sourcing from the MID rung (the 41 measured target turns were
+    mid-model sources under the escalation lane, not route_models)."""
+    return _kw(turn_id=turn_id, session_id=session_id,
+               api_call_count=api_call_count, provider=provider,
+               model=model, messages=messages)
+
+
+# 22. flash live rewrite: free pool inside the flash band -> rewritten to the
+#     flash rung on the FIRST call (mid-model source via the escalation lane).
+def test_flash_live_rewrite(monkeypatch):
+    _reset()
+    recs = []
+    cls = _Classifier([("free", 0.50)])
+    monkeypatch.setattr(pl, "_load_config", lambda: _cfg4())
+    monkeypatch.setattr(pl, "_classify", cls)
+    monkeypatch.setattr(pl, "_paid_lane_alive", _Credit(True))
+    monkeypatch.setattr(pl, "_log", recs.append)
+
+    out = pl.on_llm_request(**_kw_mid(turn_id="fl-live-1", api_call_count=1))
+    assert out is not None
+    assert out["request"]["model"] == "z-ai/glm-5.3-flash"
+    assert "flash" in out["reason"]
+    row = recs[-1]
+    assert row["tier"] == "flash"
+    assert row["applied"] is True
+    assert row["eligible"] is False  # free tier did NOT fire; flash did
+    assert row["confidence"] == 0.50
+
+
+# 23. flash shadow: decided + logged, NO rewrite, applied false.
+def test_flash_shadow_no_rewrite(monkeypatch):
+    _reset()
+    recs = []
+    cls = _Classifier([("free", 0.50)])
+    monkeypatch.setattr(pl, "_load_config", lambda: _cfg4(mode="shadow"))
+    monkeypatch.setattr(pl, "_classify", cls)
+    monkeypatch.setattr(pl, "_paid_lane_alive", _Credit(True))
+    monkeypatch.setattr(pl, "_log", recs.append)
+
+    assert pl.on_llm_request(**_kw_mid(turn_id="fl-sh-1", api_call_count=1)) is None
+    assert len(recs) == 1
+    assert recs[0]["tier"] == "flash"
+    assert recs[0]["applied"] is False
+    # shadow follow-ups (request path) stay silent and never rewritten
+    assert pl.on_llm_request(**_kw_mid(turn_id="fl-sh-1", api_call_count=2)) is None
+    assert len(recs) == 1
+
+
+# 24. flash reapply via exec on the tool follow-up (the wire path): attempt2
+#     carries the flash model; NO credit probe on the flash path, ever.
+def test_flash_reapply_via_exec(monkeypatch):
+    _reset()
+    seen = []
+    recs = []
+    cls = _Classifier([("free", 0.50)])
+    credit = _Credit(True)
+    monkeypatch.setattr(pl, "_load_config", lambda: _cfg4())
+    monkeypatch.setattr(pl, "_classify", cls)
+    monkeypatch.setattr(pl, "_paid_lane_alive", credit)
+    monkeypatch.setattr(pl, "_log", recs.append)
+
+    first = pl.on_llm_request(**_kw_mid(turn_id="fl-re-1", api_call_count=1))
+    assert first is not None
+    assert first["request"]["model"] == "z-ai/glm-5.3-flash"
+
+    req, ctx = _exec_ctx(_kw_mid(turn_id="fl-re-1", api_call_count=2))
+    assert req["model"] == "z-ai/glm-5.3"  # host rebuilt it from agent.model
+    out = pl.on_llm_execution(request=req, next_call=_capture_next(seen), **ctx)
+    assert out["model"] == "z-ai/glm-5.3-flash"  # flash persisted downstream
+    assert seen[0]["model"] == "z-ai/glm-5.3-flash"
+    assert len(cls.calls) == 1
+    assert credit.calls == 0  # flash NEVER probes — not on first call, not on re-apply
+    exec_rows = [r for r in recs if r.get("reapply") and r.get("api_call_count") == 2]
+    assert exec_rows and exec_rows[0]["tier"] == "flash"
+    assert exec_rows[0]["target"] == "z-ai/glm-5.3-flash"
+    assert "features" not in exec_rows[0]
+
+
+# 25. band boundaries: 0.40 -> flash; 0.30 -> stay mid; 0.35 (== flash_gate)
+#     -> flash (lower bound inclusive); 0.65 (== gate) -> FREE tier, not flash.
+def test_flash_band_boundaries(monkeypatch):
+    _reset()
+    recs = []
+    cls = _Classifier([("free", 0.40), ("free", 0.30), ("free", 0.35),
+                       ("free", 0.65)])
+    monkeypatch.setattr(pl, "_load_config", lambda: _cfg4())
+    monkeypatch.setattr(pl, "_classify", cls)
+    monkeypatch.setattr(pl, "_paid_lane_alive", _Credit(True))
+    monkeypatch.setattr(pl, "_log", recs.append)
+
+    # conf 0.40 -> flash
+    out = pl.on_llm_request(**_kw_mid(turn_id="fl-b-1", api_call_count=1))
+    assert out is not None and out["request"]["model"] == "z-ai/glm-5.3-flash"
+    # conf 0.30 -> below flash_gate: stay mid, untouched
+    _reset()
+    out = pl.on_llm_request(**_kw_mid(turn_id="fl-b-2", api_call_count=1))
+    assert out is None  # no rewrite, stays on the mid rung
+    assert recs[-1]["tier"] == "mid"
+    assert recs[-1]["skip_reason"] == "below_gate"
+    # conf 0.35 == flash_gate -> flash (inclusive lower bound)
+    _reset()
+    out = pl.on_llm_request(**_kw_mid(turn_id="fl-b-3", api_call_count=1))
+    assert out is not None and out["request"]["model"] == "z-ai/glm-5.3-flash"
+    # conf 0.65 == free gate -> FREE tier (flash band excludes the upper bound)
+    _reset()
+    out = pl.on_llm_request(**_kw_mid(turn_id="fl-b-4", api_call_count=1))
+    assert out is not None
+    assert out["request"]["model"] == "inclusionai/ling-3.0-flash-sante:free"
+    assert recs[-1]["tier"] == "free"
+    assert len(cls.calls) == 4
+
+
+# 26. pool=paid at 0.75 stays MID: no escalate (gate 0.80), no downgrade, no
+#     rewrite on the first call and none persisted on the exec follow-up.
+def test_paid_pool_075_stays_mid_no_downgrade(monkeypatch):
+    _reset()
+    seen = []
+    recs = []
+    cls = _Classifier([("paid", 0.75)])
+    credit = _Credit(True)
+    monkeypatch.setattr(pl, "_load_config", lambda: _cfg4())
+    monkeypatch.setattr(pl, "_classify", cls)
+    monkeypatch.setattr(pl, "_paid_lane_alive", credit)
+    monkeypatch.setattr(pl, "_log", recs.append)
+
+    out = pl.on_llm_request(**_kw_mid(turn_id="pd-75-1", api_call_count=1))
+    assert out is None  # no escalate at 0.80, no flash, no free rewrite
+    row = recs[-1]
+    assert row["tier"] == "mid"
+    assert row["skip_reason"] == "pool_paid"
+    assert row["escalate_eligible"] is False
+    # decision stored as "none": the exec follow-up leaves the payload untouched
+    req, ctx = _exec_ctx(_kw_mid(turn_id="pd-75-1", api_call_count=2))
+    out = pl.on_llm_execution(request=req, next_call=_capture_next(seen), **ctx)
+    assert out["model"] == "z-ai/glm-5.3"  # mid model went downstream verbatim
+    assert seen[0] == req
+    assert credit.calls == 0  # nothing to escalate -> no probe
+
+
+# 27. tier key present in rows across the whole ladder (classify rows AND
+#     reapply rows), values in {free, flash, paid, mid}.
+def test_tier_key_present_in_rows(monkeypatch):
+    _reset()
+    recs = []
+    cls = _Classifier([("free", 0.90), ("free", 0.50), ("paid", 0.95),
+                       ("free", 0.30)])
+    credit = _Credit(True)
+    monkeypatch.setattr(pl, "_load_config", lambda: _cfg4())
+    monkeypatch.setattr(pl, "_classify", cls)
+    monkeypatch.setattr(pl, "_paid_lane_alive", credit)
+    monkeypatch.setattr(pl, "_log", recs.append)
+
+    pl.on_llm_request(**_kw_mid(turn_id="tk-free-1", api_call_count=1))
+    pl.on_llm_request(**_kw_mid(turn_id="tk-flash-1", api_call_count=1))
+    pl.on_llm_request(**_kw_mid(turn_id="tk-paid-1", api_call_count=1))
+    pl.on_llm_request(**_kw_mid(turn_id="tk-mid-1", api_call_count=1))
+    # one exec re-apply per tier decision (free + flash carry targets)
+    for tid, tier in (("tk-free-1", "free"), ("tk-flash-1", "flash")):
+        req, ctx = _exec_ctx(_kw_mid(turn_id=tid, api_call_count=2))
+        pl.on_llm_execution(request=req, next_call=_capture_next([]), **ctx)
+    tiers = {r["tier"] for r in recs if "tier" in r}
+    assert {"free", "flash", "paid", "mid"} <= tiers
+    assert all(r.get("tier") in ("free", "flash", "paid", "mid")
+               for r in recs if not r.get("credit_lost"))
+    # reapply rows carry the decision's tier
+    by_key = {(r.get("turn_id"), r.get("api_call_count")): r for r in recs
+              if r.get("reapply")}
+    assert by_key[("tk-free-1", 2)]["tier"] == "free"
+    assert by_key[("tk-flash-1", 2)]["tier"] == "flash"
+    # paid reapply exists too (credit alive): premium persisted
+    req, ctx = _exec_ctx(_kw_mid(turn_id="tk-paid-1", api_call_count=2))
+    pl.on_llm_execution(request=req, next_call=_capture_next([]), **ctx)
+    paid_rows = [r for r in recs if r.get("reapply") and r["tier"] == "paid"]
+    assert paid_rows and paid_rows[-1]["target"] == "anthropic/claude-sonnet-5.5"
+
+
+# 28. opencode-go flash rung: the ladder resolves per provider — a mid-model
+#     turn on the subscription lane lands on ITS flash rung, same provider.
+def test_opencode_go_flash_rung(monkeypatch):
+    _reset()
+    seen = []
+    recs = []
+    cls = _Classifier([("free", 0.50)])
+    monkeypatch.setattr(pl, "_load_config", lambda: _cfg4(**{
+        "route_providers": ["nous", "opencode-go"],
+        "escalate_providers": ["nous", "opencode-go"],
+        "escalate_models": ["z-ai/glm-5.3", "glm-5.3", "glm-5.3-flash"],
+        "rungs": {"opencode-go": {"flash": "glm-5.3-flash",
+                                  "premium": "glm-5.3"}}}))
+    monkeypatch.setattr(pl, "_classify", cls)
+    monkeypatch.setattr(pl, "_paid_lane_alive", _Credit(True))
+    monkeypatch.setattr(pl, "_log", recs.append)
+
+    out = pl.on_llm_request(**_kw_mid(turn_id="og-fl-1", provider="opencode-go",
+                                      model="glm-5.3", api_call_count=1))
+    assert out is not None
+    assert out["request"]["model"] == "glm-5.3-flash"  # opencode-go's flash rung
+    # and it persists through the exec follow-up
+    req, ctx = _exec_ctx(_kw_mid(turn_id="og-fl-1", provider="opencode-go",
+                                 model="glm-5.3", api_call_count=2))
+    out = pl.on_llm_execution(request=req, next_call=_capture_next(seen), **ctx)
+    assert out["model"] == "glm-5.3-flash"
+    assert seen[0]["model"] == "glm-5.3-flash"
+    assert len(cls.calls) == 1
+
+
+# 29. flat-key fallback: rungs without a per-provider flash entry fall back to
+#     the flat "flash_model" key, mirroring free_model fallback semantics.
+def test_flash_flat_key_fallback(monkeypatch):
+    _reset()
+    recs = []
+    cls = _Classifier([("free", 0.50)])
+    monkeypatch.setattr(pl, "_load_config", lambda: _cfg4(
+        rungs={"nous": {"premium": "anthropic/claude-sonnet-5.5"}}))
+    monkeypatch.setattr(pl, "_classify", cls)
+    monkeypatch.setattr(pl, "_paid_lane_alive", _Credit(True))
+    monkeypatch.setattr(pl, "_log", recs.append)
+
+    out = pl.on_llm_request(**_kw_mid(turn_id="ff-1", api_call_count=1))
+    assert out is not None
+    assert out["request"]["model"] == "z-ai/glm-5.3-flash"
+
+
+# 30. no flash rung configured -> band stays mid (fail-open, like v1.0.5).
+def test_flash_band_without_rung_stays_mid(monkeypatch):
+    _reset()
+    recs = []
+    cls = _Classifier([("free", 0.50)])
+    monkeypatch.setattr(pl, "_load_config", lambda: _cfg4(flash_model=""))
+    monkeypatch.setattr(pl, "_classify", cls)
+    monkeypatch.setattr(pl, "_paid_lane_alive", _Credit(True))
+    monkeypatch.setattr(pl, "_log", recs.append)
+
+    out = pl.on_llm_request(**_kw_mid(turn_id="nfr-1", api_call_count=1))
+    assert out is None
+    assert recs[-1]["tier"] == "mid"
+    assert recs[-1]["skip_reason"] == "below_gate"
+
+
+# 31. the code default escalate gate is 0.80: a config WITHOUT
+#     escalate_confidence_gate escalates only at >= 0.80 (0.75 stays mid) —
+#     the approved ladder pinned against regression to 0.65.
+def test_escalate_gate_default_is_080(monkeypatch):
+    _reset()
+    recs = []
+    cls = _Classifier([("paid", 0.75), ("paid", 0.86)])
+    monkeypatch.setattr(pl, "_load_config", lambda: _cfg4(
+        escalate_confidence_gate=None))
+    monkeypatch.setattr(pl, "_classify", cls)
+    monkeypatch.setattr(pl, "_paid_lane_alive", _Credit(True))
+    monkeypatch.setattr(pl, "_log", recs.append)
+
+    assert pl.on_llm_request(**_kw_mid(turn_id="g80-1", api_call_count=1)) is None
+    assert recs[-1]["tier"] == "mid"
+    _reset()
+    out = pl.on_llm_request(**_kw_mid(turn_id="g80-2", api_call_count=1))
+    assert out is not None
+    assert out["request"]["model"] == "anthropic/claude-sonnet-5.5"
+    assert recs[-1]["tier"] == "paid"
+    assert pl.DEFAULT_GATE == 0.80
+
+
+# 32. stored flash decision survives a request-path reapply too (host
+#     re-invoking llm_request instead of exec): same flash model, one classify.
+def test_flash_reapply_via_request_path(monkeypatch):
+    _reset()
+    recs = []
+    cls = _Classifier([("free", 0.50)])
+    monkeypatch.setattr(pl, "_load_config", lambda: _cfg4())
+    monkeypatch.setattr(pl, "_classify", cls)
+    monkeypatch.setattr(pl, "_paid_lane_alive", _Credit(True))
+    monkeypatch.setattr(pl, "_log", recs.append)
+
+    first = pl.on_llm_request(**_kw_mid(turn_id="frr-1", api_call_count=1))
+    assert first is not None
+    second = pl.on_llm_request(**_kw_mid(turn_id="frr-1", api_call_count=2))
+    assert second is not None
+    assert second["request"]["model"] == "z-ai/glm-5.3-flash"
+    assert len(cls.calls) == 1
+    row = [r for r in recs if r.get("reapply")][-1]
+    assert row["tier"] == "flash"
+    assert row["reapply"] is True

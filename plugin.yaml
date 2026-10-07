@@ -1,6 +1,6 @@
 name: kfchow-llm-value-router
-version: "1.0.5"
-description: "Per-turn LLM model routing guided by the KFChow value leaderboard. On the first provider call of a turn, a vendor classifier decides free vs strong tier; in live mode it rewrites the request model. Fail-open, shadow-by-default."
+version: "1.0.6"
+description: "Per-turn LLM model routing guided by the KFChow value leaderboard. On the first provider call of a turn, a vendor classifier picks a tier on a 4-rung ladder (free / flash / mid / premium) and in live mode rewrites the request model to that tier's rung. Fail-open, shadow-by-default."
 author: KFChow
 license: MIT
 requires_hermes: ">=0.21.5"
@@ -40,6 +40,13 @@ config_schema:
   free_model:
     type: str
     description: "Flat free-tier fallback rung (per-provider rungs take precedence)."
+  flash_gate:
+    type: float
+    default: 0.35
+    description: "Lower bound of the FLASH band: free-pool turns with flash_gate <= confidence < confidence_gate route to the flash rung instead of staying mid."
+  flash_model:
+    type: str
+    description: "Flat flash-tier fallback rung (per-provider rungs take precedence)."
   escalate_enabled:
     type: bool
     default: true
@@ -55,7 +62,8 @@ config_schema:
     description: "Flat premium fallback rung (per-provider rungs take precedence)."
   escalate_confidence_gate:
     type: float
-    description: "Escalation gate; falls back to confidence_gate when unset."
+    default: 0.80
+    description: "Escalation gate (premium tier); falls back to the code default 0.80 when unset."
   credit_probe:
     type: bool
     default: true

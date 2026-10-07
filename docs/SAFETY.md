@@ -18,7 +18,8 @@ Concretely enforced:
   disabled** for the routing call — a slow vendor must not stall a turn.
 - Eligibility filters run BEFORE any network call: only providers/models
   listed in `route_providers`/`route_models` (downgrade) or
-  `escalate_providers`/`escalate_models` (escalation) are ever considered.
+  `escalate_providers`/`escalate_models` (escalation and the flash band) are
+  ever considered.
 
 ## Shadow-first
 
@@ -30,6 +31,12 @@ explicit human action: edit the config and set `"mode": "live"`.
 ## Credit probe: fail-CLOSED (escalation direction only)
 
 The downgrade path (mid/flash -> free) needs no key and makes no credit call.
+The FLASH tier (mid -> flash, v1.0.6) is also a downgrade: it fires when a
+free-pool verdict lands in the flash band (`flash_gate` <= confidence <
+`confidence_gate`, default 0.35–0.65) and a flash rung is configured;
+otherwise the turn stays mid. Flash never probes credits and never needs a
+key — the credit gate exists only for the ESCALATION direction, which is the
+only move that costs money the turn was not already spending.
 The ESCALATION path (mid -> premium, on a METERED provider) probes the paid
 lane first with a 2-token request; the probe result is cached for 5 minutes
 and is FAIL-CLOSED:
@@ -89,6 +96,8 @@ text ever leaves the machine or reaches the log file.
   the stored decision (including "no rewrite") is re-applied on later
   calls of the same turn.
 - Never sends a rewrite to a different provider than the request came from.
+- Never downgrades a paid-pool verdict: below the escalation gate a paid
+  turn stays mid; only free-pool turns drop to the flash band.
 - Never reads `~/.hermes/.env` or any secrets file directly.
 - Never logs or transmits the API key values.
 - Never overwrites the last-good rungs file on a failed feed parse

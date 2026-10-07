@@ -2,9 +2,12 @@
 
 WHAT IT DOES
     On the FIRST provider call of each turn, asks Jev (TypeSafe System One)
-    whether the turn is routine enough to hand to the FREE tier. In `shadow`
-    mode it only records the decision; in `live` mode it rewrites the request's
-    model so the turn is served by the free pool instead of the paid lane.
+    which pool the turn belongs to, then routes it down a 4-TIER ladder:
+    free (routine, conf >= free gate), flash (near-routine, flash_gate <=
+    conf < free gate), mid (stays on the configured model), premium (strong
+    turns escalate, credit-probed). In `shadow` mode it only records the
+    decision; in `live` mode it rewrites the request's model to the tier's
+    rung.
 
     An ESCALATION path runs the other direction: when a turn starts on a "mid"
     rung and the classifier says it needs a strong model, the request can be
@@ -74,6 +77,12 @@ ROUTING_QUESTION_ID = "routing_tier"
 JEV_TIMEOUT_S = 10          # keep well under a turn's own latency budget
 DEFAULT_GATE = 0.80
 DEFAULT_EXCERPT_CHARS = 1200
+# FLASH TIER (v1.0.6, the 4-tier ladder). free-pool turns BELOW the free gate
+# but at or above the flash gate are near-routine work a small paid-by-token
+# workhorse handles adequately — far cheaper than keeping them on the mid rung,
+# and never a downgrade of a paid-pool verdict (those stay mid below the
+# escalation gate). Below the flash gate: mid (no rewrite).
+DEFAULT_FLASH_GATE = 0.35
 
 # Same pool semantics as the offline measurement, so live decisions are
 # comparable to the data that justified them.
@@ -187,11 +196,12 @@ def _load_config():
            "route_providers": ["nous"],
            "route_models": [],
            "free_model": "",
+           "flash_gate": DEFAULT_FLASH_GATE,
            "escalate_enabled": True,
            "escalate_providers": [],
            "escalate_models": [],
            "premium_model": "",
-           "escalate_confidence_gate": None,   # falls back to confidence_gate
+           "escalate_confidence_gate": None,   # falls back to DEFAULT_GATE (0.80)
            "credit_probe": True,
            "send_excerpt": True,
            "excerpt_chars": DEFAULT_EXCERPT_CHARS,
@@ -366,10 +376,25 @@ def on_llm_request(**kwargs):
                 _log({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                       "turn_id": turn_id, "session_id": session_id,
                       "provider": provider, "model": model, "target": target,
-                      "applied": True, "reapply": True,
+                      "applied": True, "reapply": True, "tier": "free",
                       "api_call_count": api_call_count})
                 return {"request": updated, "source": "jev-lane2-router",
                         "reason": "reapply: free tier"}
+            if decision == "flash":
+                # FLASH re-apply mirrors free: no credit probe (flash is the
+                # stable workhorse; host retry/fail-open covers a 404).
+                target = known["target"]
+                if not target:
+                    return None  # fail-open defensive: never rewrite to ''
+                updated = dict(request)
+                updated["model"] = target
+                _log({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                      "turn_id": turn_id, "session_id": session_id,
+                      "provider": provider, "model": model, "target": target,
+                      "applied": True, "reapply": True, "tier": "flash",
+                      "api_call_count": api_call_count})
+                return {"request": updated, "source": "jev-lane2-router",
+                        "reason": "reapply: flash tier"}
             if decision == "paid":
                 target = known["target"]
                 if not target:
@@ -382,14 +407,14 @@ def on_llm_request(**kwargs):
                     _log({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                           "turn_id": turn_id, "session_id": session_id,
                           "provider": provider, "model": model,
-                          "applied": False, "credit_lost": True})
+                          "applied": False, "credit_lost": True, "tier": "paid"})
                     return None
                 updated = dict(request)
                 updated["model"] = target
                 _log({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                       "turn_id": turn_id, "session_id": session_id,
                       "provider": provider, "model": model, "target": target,
-                      "applied": True, "reapply": True,
+                      "applied": True, "reapply": True, "tier": "paid",
                       "api_call_count": api_call_count})
                 return {"request": updated, "source": "jev-lane2-router",
                         "reason": "reapply: premium"}
@@ -429,9 +454,25 @@ def on_llm_request(**kwargs):
 
         gate = float(cfg.get("confidence_gate", DEFAULT_GATE))
         free_model = _rung(cfg, provider, "free", "free_model")
-        eligible = (free_src and pool == "free" and confidence is not None
-                    and float(confidence) >= gate and bool(free_model))
         mode = str(cfg.get("mode", "shadow")).lower()
+
+        # ---- FLASH TIER (v1.0.6, the 4-tier ladder) -----------------------
+        # free-pool turns BELOW the free gate but AT/ABOVE the flash gate are
+        # near-routine: cheaper to serve on the provider's flash workhorse
+        # than to keep billing them on the mid rung. Fails open: without a
+        # flash rung (per-provider or flat fallback) the band stays mid.
+        # pool=paid NEVER lands here — a paid verdict below the escalation
+        # gate stays mid (downgrading planning turns would put them on flash).
+        flash_gate_raw = cfg.get("flash_gate")
+        try:
+            flash_gate = float(flash_gate_raw if flash_gate_raw is not None
+                               else DEFAULT_FLASH_GATE)
+        except (TypeError, ValueError):
+            flash_gate = DEFAULT_FLASH_GATE
+        flash_model = _rung(cfg, provider, "flash", "flash_model")
+        flash_eligible = (pool == "free" and confidence is not None
+                          and flash_gate <= float(confidence) < gate
+                          and bool(flash_model))
 
         # ---- ESCALATION (mid -> premium), the other direction -------------
         # Fires when the turn is on a MID rung and the classifier says it needs
@@ -439,8 +480,12 @@ def on_llm_request(**kwargs):
         # exhausted account would fail the turn, which is worse than a weaker
         # answer.
         esc_gate_raw = cfg.get("escalate_confidence_gate")
+        # v1.0.6 ladder: the escalation gate defaults to the code-level 0.80
+        # (DEFAULT_GATE), NOT to confidence_gate — escalation to the premium
+        # rung must never silently ride the free tier's lower gate, and an
+        # explicit config override still wins.
         esc_gate = float(esc_gate_raw if esc_gate_raw is not None
-                         else cfg.get("confidence_gate", DEFAULT_GATE))
+                         else DEFAULT_GATE)
         premium = _rung(cfg, provider, "premium", "premium_model")
         esc_eligible = (
             esc_src
@@ -455,13 +500,23 @@ def on_llm_request(**kwargs):
             if not credit_ok:
                 esc_eligible = False
 
+        # The FREE tier rides the same eligibility union as escalation: the
+        # 41 measured target turns are mid-model sources listed under the
+        # escalation lane, not route_models, and their free-pool verdicts
+        # below the gate are exactly the band the flash tier serves.
+        eligible = ((free_src or esc_src) and pool == "free"
+                    and confidence is not None and float(confidence) >= gate
+                    and bool(free_model))
+
         # Store the RESOLVED decision for EVERY classified turn (incl. "none":
         # below-gate / not-eligible / credit-blocked) so retries and follow-ups
         # never re-classify and re-application stays deterministic.
-        _store_decision(key, provider, "free" if eligible else
-                        ("paid" if esc_eligible else "none"),
-                        free_model if eligible else
-                        (premium if esc_eligible else None),
+        decision = "free" if eligible else ("flash" if flash_eligible else
+                    ("paid" if esc_eligible else "none"))
+        target = (free_model if eligible else
+                  (flash_model if flash_eligible else
+                   (premium if esc_eligible else None)))
+        _store_decision(key, provider, decision, target,
                         float(confidence) if confidence is not None else 0.0)
 
         log_feats = feats if cfg.get("send_excerpt", True) else {
@@ -470,11 +525,14 @@ def on_llm_request(**kwargs):
               "session_id": session_id,
               "provider": provider, "model": model, "pool": pool,
               "confidence": confidence, "gate": gate, "eligible": eligible,
-              "mode": mode, "applied": bool(eligible and mode == "live"),
-              "skip_reason": None if (eligible or esc_eligible) else (
+              "mode": mode,
+              "applied": bool((eligible or flash_eligible) and mode == "live"),
+              "tier": decision if decision != "none" else "mid",
+              "skip_reason": None if (eligible or flash_eligible or esc_eligible) else (
                   "below_gate" if pool == "free" else "pool_paid"),
               "escalate_eligible": esc_eligible,
               "escalate_applied": bool(esc_eligible and mode == "live"),
+              "flash_model": flash_model if flash_eligible else None,
               "premium_model": premium if esc_eligible else None,
               "credit_ok": credit_ok,
               "features": log_feats})
@@ -487,6 +545,13 @@ def on_llm_request(**kwargs):
             updated["model"] = free_model
             return {"request": updated, "source": "kfchow-llm-value-router",
                     "reason": "free tier (conf %.2f >= %.2f)" % (confidence, gate)}
+
+        if flash_eligible:
+            updated = dict(request)
+            updated["model"] = flash_model
+            return {"request": updated, "source": "kfchow-llm-value-router",
+                    "reason": "flash tier (conf %.2f in [%.2f, %.2f))"
+                              % (confidence, flash_gate, gate)}
 
         if esc_eligible:
             updated = dict(request)
@@ -588,7 +653,22 @@ def on_llm_execution(request=None, next_call=None, **context):
                 _log({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                       "turn_id": turn_id, "session_id": session_id,
                       "provider": provider, "model": model, "target": target,
-                      "applied": True, "reapply": True,
+                      "applied": True, "reapply": True, "tier": "free",
+                      "api_call_count": api_call_count})
+            return _dispatch(req)
+
+        if decision == "flash":
+            # FLASH re-apply: NO credit probe — flash never probes (the probe
+            # stays free/paid-tier only; flash is the stable workhorse and a
+            # flash 404 is covered by the host's retry/fail-open).
+            if not target:  # defensive: never rewrite to ''
+                return _dispatch(request)
+            if mode == "live":
+                req["model"] = target
+                _log({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                      "turn_id": turn_id, "session_id": session_id,
+                      "provider": provider, "model": model, "target": target,
+                      "applied": True, "reapply": True, "tier": "flash",
                       "api_call_count": api_call_count})
             return _dispatch(req)
 
@@ -601,14 +681,14 @@ def on_llm_execution(request=None, next_call=None, **context):
                 _log({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                       "turn_id": turn_id, "session_id": session_id,
                       "provider": provider, "model": model,
-                      "applied": False, "credit_lost": True})
+                      "applied": False, "credit_lost": True, "tier": "paid"})
                 return _dispatch(request)
             if mode == "live":
                 req["model"] = target
                 _log({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                       "turn_id": turn_id, "session_id": session_id,
                       "provider": provider, "model": model, "target": target,
-                      "applied": True, "reapply": True,
+                      "applied": True, "reapply": True, "tier": "paid",
                       "api_call_count": api_call_count})
             return _dispatch(req)
 
@@ -639,9 +719,10 @@ def on_llm_execution(request=None, next_call=None, **context):
 def _store_decision(key, provider, decision, target, conf):
     """Record the classified decision for a turn (called AFTER _classify).
 
-    Every classified turn gets a row — "free"/"paid" carry the resolved target;
-    "none" covers below-gate, not-eligible and credit-blocked outcomes so a
-    retry never re-classifies. All state access happens under _DECISIONS_LOCK.
+    Every classified turn gets a row — "free"/"flash"/"paid" carry the
+    resolved target; "none" covers below-gate, not-eligible and
+    credit-blocked outcomes so a retry never re-classifies. All state access
+    happens under _DECISIONS_LOCK.
     """
     try:
         with _DECISIONS_LOCK:

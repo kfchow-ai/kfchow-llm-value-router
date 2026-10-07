@@ -22,15 +22,33 @@ keep the routed model instead of silently reverting. The plugin:
 
 1. checks eligibility — only providers/models you list in the config are ever
    touched, and a turn already on a free-tier model is never re-routed;
-2. asks a vendor classifier (TypeSafe "Jev", a 3–10s bounded call) whether the
-   turn is routine enough for the FREE tier;
+2. asks a vendor classifier (TypeSafe "Jev", a 3–10s bounded call) which pool
+   the turn belongs to (routine vs strong) and how confident it is;
 3. in `shadow` mode (default): records the decision and leaves the request
-   untouched; in `live` mode: rewrites the request's model to the provider's
-   free rung;
+   untouched; in `live` mode: rewrites the request's model to the tier's rung;
 4. conversely, when a turn starts on a **mid** rung and the classifier says it
    needs a strong model, the ESCALATION path can rewrite to the provider's
    premium rung — guarded by a credit probe that **fails closed** so an
    exhausted metered account never receives a doomed rewrite.
+
+### The 4-tier ladder (v1.0.6)
+
+One classify per turn → pool + confidence → exactly one tier:
+
+| tier | condition | target rung |
+|------|-----------|-------------|
+| premium | pool=paid AND conf ≥ `escalate_confidence_gate` (default **0.80**) | provider's premium rung (credit-probed, fail-closed) |
+| free | pool=free AND conf ≥ `confidence_gate` | provider's free rung |
+| **flash** | pool=free AND `flash_gate` ≤ conf < `confidence_gate` (default band 0.35–0.65) | provider's **flash** rung — near-routine turns off the mid rung at a fraction of its price |
+| mid (stay) | everything else | unchanged — pool=paid below the escalation gate NEVER downgrades |
+
+`flash_gate` defaults to 0.35; the flash rung resolves per provider
+(`rungs.<provider>.flash`, falling back to the flat `flash_model` key) exactly
+like the free rung. With no flash rung configured the band simply stays mid —
+fail-open. Flash never touches the credit probe: it is the stable workhorse
+tier, and host retry/fail-open covers a flash 404. Escalation defaults to the
+0.80 gate (an explicit `escalate_confidence_gate` override still wins), so the
+0.65–0.79 band no longer false-escalates.
 
 Model rungs come from the KFChow value leaderboard (https://kfchow.com/llm)
 via the bundled resolver script — never hardcoded — because rankings update
@@ -40,10 +58,12 @@ twice daily and free-tier model ids expire silently.
 
 - **Fail-open**: any error/timeout/malformed answer returns `None`; the
   original request is untouched. The plugin can fail to route; it never fails
-  a turn.
+  a turn. With no flash rung configured the flash band stays mid — an absent
+  tier can never break a turn.
 - **Shadow by default**; live requires a deliberate config edit by a human.
 - **Credit probe fails closed**: escalation to a paid premium rung only fires
   when the metered lane answers a live probe; unknown state = no escalation.
+  The flash tier never probes and never needs a key.
 - **A rewrite never crosses providers**: rungs resolve per provider.
 - **Local-only telemetry**: decision logs go to `~/.hermes/jev/lane2-live.jsonl`
   (0600), nothing is uploaded.

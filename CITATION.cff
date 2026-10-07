@@ -5,8 +5,8 @@ authors:
   - name: "KFChow AI Lab"
     email: hotline@kfchow.com
     website: "https://kfchow.com/llm"
-version: 1.0.5
-date-released: "2026-10-06"
+version: 1.0.6
+date-released: "2026-10-07"
 license: MIT
 repository-code: "https://github.com/kfchow-ai/kfchow-llm-value-router"
 url: "https://kfchow.com/llm"
@@ -16,4 +16,4 @@ keywords:
   - cost-optimization
   - hermes-agent
   - value-leaderboard
-abstract: "A Hermes Agent llm_request middleware that classifies each turn (routine vs strategic) and routes it to the cheapest adequate model tier - downgrade to the provider's free rung or escalate to premium - with a fail-open contract, shadow-by-default rollout, credit-aware escalation that fails closed, and per-provider rungs derived from a live value leaderboard feed rather than hardcoded model ids."
+abstract: "A Hermes Agent llm_request/llm_execution middleware pair that classifies each turn once (routine vs strategic) and routes it down a 4-tier ladder - downgrade to the provider's free rung, serve near-routine turns on a cheap flash workhorse, keep hard turns on the mid rung, or escalate to premium (credit-probed, fail-closed) - with re-applied decisions across every call of a turn, a fail-open contract, shadow-by-default rollout, and per-provider rungs derived from a live value leaderboard feed rather than hardcoded model ids."
