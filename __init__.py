@@ -1,4 +1,4 @@
-"""kfchow-llm-value-router — per-turn model routing for Hermes (llm_request middleware).
+"""kfchow-llm-value-router — per-turn model routing for Hermes (llm_request + llm_execution middleware).
 
 WHAT IT DOES
     On the FIRST provider call of each turn, asks Jev (TypeSafe System One)
@@ -11,10 +11,20 @@ WHAT IT DOES
     escalated to the provider's premium rung — guarded by a credit probe so a
     metered provider with an exhausted balance never receives a doomed rewrite.
 
-WHY MIDDLEWARE (not a cron, not a skill)
+WHY TWO MIDDLEWARE (not a cron, not a skill)
     `llm_request` is the documented cutover path: it sees the full provider
     kwargs and can replace them. A skill is advisory and a cron cannot act on
     a live turn.
+
+    But the host's llm_request chain runs only ONCE per turn on the real
+    tool-follow-up path (attempt1; retries re-invoke it, tool-loop follow-ups
+    do not), so a rewrite stored there silently reverts the moment the agent
+    executes a tool and calls the provider again. `llm_execution` wraps the
+    actual provider call — the host runs that chain on EVERY attempt, follow-
+    ups included (agent/turn_api_call.py) — so the second middleware re-applies
+    the turn's stored decision on every single call. Classification stays
+    exactly once per turn, in `llm_request`; the execution middleware never
+    classifies, it only re-applies what was already decided.
 
 SAFETY CONTRACT (every one of these is enforced in code, not convention)
     * Fail-open: any exception, timeout, or malformed answer returns None so
@@ -32,6 +42,11 @@ SAFETY CONTRACT (every one of these is enforced in code, not convention)
     * A rewrite NEVER crosses providers: the rungs are resolved per provider,
       so the model id sent always belongs to the originating provider's API.
     * Mode is `shadow` until a human flips `mode` to `live` in the config.
+    * The llm_execution wrapper calls next_call EXACTLY once per invocation:
+      it is the provider call itself. Fail-open covers only OUR code — any
+      error from downstream (the provider/next middleware) propagates after
+      having been invoked, and a next_call that was never invoked is handed
+      the untouched request, never swallowed.
     * Telemetry: decision logs are written to a local JSONL file only. Set
       `send_excerpt: false` to keep task text out of the vendor call AND the
       log (shape-only features still classify, with reduced accuracy).
@@ -486,6 +501,141 @@ def on_llm_request(**kwargs):
         return None
 
 
+def on_llm_execution(request=None, next_call=None, **context):
+    """llm_execution middleware: re-apply the turn's stored decision on EVERY
+    provider call, tool follow-ups included.
+
+    Contract (hermes_cli/middleware.py _run_execution_chain, call site
+    agent/turn_api_call.py): ``request`` is the provider payload and
+    ``next_call(request)`` IS the downstream execution — it must be invoked
+    EXACTLY once per invocation of this callback. The host's own frame guards
+    double invocation (second call raises), so this wrapper:
+
+    * calls next_call exactly once on every path, and
+    * lets downstream exceptions PROPAGATE (a provider error must reach the
+      host verbatim — swallowing it here would turn one doomed attempt into
+      either a lost response or an illegal retry-by-proxy).
+
+    Fail-open covers only OUR code: any exception raised before next_call is
+    dispatched retries the call once with the untouched ORIGINAL request, and
+    a failure of even that propagates — with next_call invoked exactly once
+    either way. The rewrite is applied to a copy, so a bookkeeping failure can
+    never leak a half-applied rewrite into the fail-open dispatch.
+    Once next_call HAS been dispatched, this wrapper re-raises anything that
+    unwinds through it (downstream truth: provider error, KeyboardInterrupt,
+    a post-dispatch failure) instead of masking it with None. This function
+    NEVER classifies (side effects would double with on_llm_request) and
+    NEVER returns a rewrite payload — the rewrite is the request dict handed
+    to next_call.
+    """
+    if not callable(next_call):
+        raise TypeError("on_llm_execution requires a callable next_call "
+                        "(host execution-chain contract)")
+    invoked = [False]
+
+    def _dispatch(payload):
+        # The ONLY path that touches next_call: marks itself first so no
+        # handler ever dispatches a second time (host frame: single-use).
+        invoked[0] = True
+        return next_call(payload)
+
+    try:
+        cfg = _load_config()
+        if not cfg.get("enabled", True):
+            return _dispatch(request)
+
+        # Shallow copy: our rewrite must not half-mutate the host's payload
+        # if bookkeeping fails mid-flight; the fail-open dispatch then hands
+        # downstream the genuinely untouched original (addendum allows
+        # "the request dict (or a modified copy)").
+        req = dict(request) if isinstance(request, dict) else {}
+        provider = str(context.get("provider") or "")
+        model = str(context.get("model") or req.get("model") or "")
+        turn_id = str(context.get("turn_id") or "")
+        session_id = str(context.get("session_id") or "")
+        api_call_count = context.get("api_call_count")
+        mode = str(cfg.get("mode", "shadow")).lower()
+
+        # Same store, same key, same eviction policy as on_llm_request.
+        key = f"{session_id}:{turn_id}"
+        with _DECISIONS_LOCK:
+            now = time.monotonic()
+            for k in [k for k, v in _DECISIONS.items()
+                      if (now - v["ts"]) >= _DECISIONS_TTL_S]:
+                del _DECISIONS[k]
+            while len(_DECISIONS) > _DECISIONS_MAX:
+                _DECISIONS.popitem(last=False)  # evict oldest (LRU)
+            known = _DECISIONS.get(key)
+            if known is not None:
+                # Refresh recency so an active turn is not LRU-evicted mid-flight.
+                _DECISIONS[key] = known
+                _DECISIONS.move_to_end(key)
+
+        # Unknown / expired turn: execution must not classify. llm_request owns
+        # first-call classification (its api_call_count gate fires there); here
+        # an unknown key means "no decision yet" — pass the payload untouched.
+        if known is None or provider != known["provider"]:
+            return _dispatch(request)
+
+        decision = known["decision"]
+        target = known.get("target")
+
+        if decision == "free":
+            if not target:  # defensive: never rewrite to ''
+                return _dispatch(request)
+            if mode == "live":
+                req["model"] = target
+                _log({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                      "turn_id": turn_id, "session_id": session_id,
+                      "provider": provider, "model": model, "target": target,
+                      "applied": True, "reapply": True,
+                      "api_call_count": api_call_count})
+            return _dispatch(req)
+
+        if decision == "paid":
+            if not target:  # defensive: never rewrite to ''
+                return _dispatch(request)
+            # Fail-closed on a dark paid lane; the probe is TTL-cached.
+            if (mode == "live" and cfg.get("credit_probe", True)
+                    and provider == "nous" and not _paid_lane_alive()):
+                _log({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                      "turn_id": turn_id, "session_id": session_id,
+                      "provider": provider, "model": model,
+                      "applied": False, "credit_lost": True})
+                return _dispatch(request)
+            if mode == "live":
+                req["model"] = target
+                _log({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                      "turn_id": turn_id, "session_id": session_id,
+                      "provider": provider, "model": model, "target": target,
+                      "applied": True, "reapply": True,
+                      "api_call_count": api_call_count})
+            return _dispatch(req)
+
+        # decision "none" (below-gate / not-eligible / credit-blocked) and the
+        # shadow branch of free/paid above: never rewritten, never re-logged.
+        return _dispatch(request)
+    except Exception as e:
+        # Reached ONLY by failures in OUR pre-dispatch code: a downstream
+        # exception unwinding through next_call re-raises past this handler
+        # unwrapped (see _run_execution_chain's _DownstreamExecutionError
+        # re-raise). Fail-open = hand the host the untouched request via one
+        # last dispatch; even if THAT fails, next_call was still invoked
+        # exactly once and the error propagates verbatim.
+        logger.warning("kfchow-llm-value-router exec failed open: %s", e)
+        if not invoked[0]:
+            try:
+                return _dispatch(request)
+            except BaseException:
+                logger.exception(
+                    "kfchow-llm-value-router exec: final dispatch attempt "
+                    "failed; propagating to the host.")
+                raise
+        # Bookkeeping failed after a dispatch already happened: the call went
+        # out; let the exception surface rather than mask the outcome with None.
+        raise
+
+
 def _store_decision(key, provider, decision, target, conf):
     """Record the classified decision for a turn (called AFTER _classify).
 
@@ -507,3 +657,4 @@ def _store_decision(key, provider, decision, target, conf):
 
 def register(ctx):
     ctx.register_middleware("llm_request", on_llm_request)
+    ctx.register_middleware("llm_execution", on_llm_execution)

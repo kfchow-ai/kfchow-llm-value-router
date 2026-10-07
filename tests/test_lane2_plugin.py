@@ -405,8 +405,9 @@ def test_classify_passes_retries_zero_and_timeout(monkeypatch):
     assert seen["timeout"] == 7.0
 
 
-def test_register_registers_middleware_only():
-    """F1/V2 truth-in-manifest: register() declares exactly llm_request."""
+def test_register_registers_both_middlewares():
+    """F1/V2 truth-in-manifest: register() declares exactly the two middlewares
+    it ships, in plugin.yaml provides_middleware sync order."""
     registered = []
 
     class Ctx:
@@ -414,4 +415,4 @@ def test_register_registers_middleware_only():
             registered.append(kind)
 
     pl.register(Ctx())
-    assert registered == ["llm_request"]
+    assert registered == ["llm_request", "llm_execution"]

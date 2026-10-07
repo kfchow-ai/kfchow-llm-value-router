@@ -151,8 +151,8 @@ endpoint. Rungs are resolved per provider and rewrites stay same-provider.
 ## Files
 
 ```
-├── plugin.yaml                # manifest (provides_middleware: [llm_request])
-├── __init__.py                # the middleware
+├── plugin.yaml                # manifest (provides_middleware: [llm_request, llm_execution])
+├── __init__.py                # the middleware (request: classify+rewrite; execution: re-apply)
 ├── scripts/jev_client.py      # vendored vendor client (env-first key)
 ├── scripts/llm-rank-resolver.py  # feed -> rungs resolver
 ├── skills/llm-value-leaderboard-rungs/   # the method as a standalone skill
