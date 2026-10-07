@@ -1,5 +1,5 @@
 name: kfchow-llm-value-router
-version: "1.0.0"
+version: "1.0.4"
 description: "Per-turn LLM model routing guided by the KFChow value leaderboard. On the first provider call of a turn, a vendor classifier decides free vs strong tier; in live mode it rewrites the request model. Fail-open, shadow-by-default."
 author: KFChow
 license: MIT

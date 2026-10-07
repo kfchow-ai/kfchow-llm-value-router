@@ -46,6 +46,12 @@ def _cfg(**over):
     return base
 
 
+def _reset_decisions():
+    """Clear the module-level turn-decision cache so tests start from empty state."""
+    with pl._DECISIONS_LOCK:
+        pl._DECISIONS.clear()
+
+
 # --------------------------------------------------------------- escalation
 
 def _mid_kwargs():
@@ -57,7 +63,7 @@ def test_escalation_rewrites_mid_turn_to_premium(monkeypatch):
     monkeypatch.setattr(pl, "_classify", lambda feats, cfg: ("paid", 0.90))
     monkeypatch.setattr(pl, "_paid_lane_alive", lambda: True)
     monkeypatch.setattr(pl, "_log", lambda rec: None)
-    pl._STATE["last_turn"] = None
+    _reset_decisions()
     kw = _mid_kwargs()
     kw["turn_id"] = "esc-1"
     out = pl.on_llm_request(**kw)
@@ -72,7 +78,7 @@ def test_escalation_blocked_when_credits_dead(monkeypatch):
     monkeypatch.setattr(pl, "_classify", lambda feats, cfg: ("paid", 0.99))
     monkeypatch.setattr(pl, "_paid_lane_alive", lambda: False)
     monkeypatch.setattr(pl, "_log", lambda rec: None)
-    pl._STATE["last_turn"] = None
+    _reset_decisions()
     assert pl.on_llm_request(**_mid_kwargs()) is None
 
 
@@ -84,7 +90,7 @@ def test_escalation_fails_closed_when_probe_raises(monkeypatch):
     monkeypatch.setattr(pl, "urllib", type("U", (), {"request": None})())
     pl._CREDIT["ok"] = None
     pl._CREDIT["checked_at"] = 0.0
-    pl._STATE["last_turn"] = None
+    _reset_decisions()
     assert pl.on_llm_request(**_mid_kwargs()) is None   # unknown => no escalation
 
 
@@ -94,7 +100,7 @@ def test_escalation_ignores_flash_default(monkeypatch):
     monkeypatch.setattr(pl, "_classify", lambda feats, cfg: ("paid", 0.99))
     monkeypatch.setattr(pl, "_paid_lane_alive", lambda: True)
     monkeypatch.setattr(pl, "_log", lambda rec: None)
-    pl._STATE["last_turn"] = None
+    _reset_decisions()
     assert pl.on_llm_request(**_kwargs()) is None       # flash default
 
 
@@ -104,7 +110,7 @@ def test_escalation_disabled_by_config(monkeypatch):
     monkeypatch.setattr(pl, "_classify", lambda feats, cfg: ("paid", 0.99))
     monkeypatch.setattr(pl, "_paid_lane_alive", lambda: True)
     monkeypatch.setattr(pl, "_log", lambda rec: None)
-    pl._STATE["last_turn"] = None
+    _reset_decisions()
     assert pl.on_llm_request(**_mid_kwargs()) is None
 
 
@@ -114,7 +120,7 @@ def test_escalation_respects_its_own_gate(monkeypatch):
     monkeypatch.setattr(pl, "_classify", lambda feats, cfg: ("paid", 0.70))
     monkeypatch.setattr(pl, "_paid_lane_alive", lambda: True)
     monkeypatch.setattr(pl, "_log", lambda rec: None)
-    pl._STATE["last_turn"] = None
+    _reset_decisions()
     assert pl.on_llm_request(**_mid_kwargs()) is None
 
 
@@ -151,7 +157,7 @@ def test_per_provider_rungs_never_cross_providers(monkeypatch):
     monkeypatch.setattr(pl, "_paid_lane_alive", lambda: True)
     monkeypatch.setattr(pl, "_log", lambda rec: None)
 
-    pl._STATE["last_turn"] = None
+    _reset_decisions()
     kw = _kwargs(provider="opencode-go", model="glm-5.3-flash")
     kw["turn_id"] = "oc-1"
     out = pl.on_llm_request(**kw)
@@ -159,7 +165,7 @@ def test_per_provider_rungs_never_cross_providers(monkeypatch):
     # Escalation must land on THIS provider's premium, not the other lane's.
     assert out["request"]["model"] == "glm-5.3"
 
-    pl._STATE["last_turn"] = None
+    _reset_decisions()
     kw2 = _kwargs(provider="nous", model="z-ai/glm-5.3")
     kw2["turn_id"] = "nous-1"
     out2 = pl.on_llm_request(**kw2)
@@ -181,7 +187,7 @@ def test_subscription_lane_skips_credit_probe(monkeypatch):
         raise AssertionError("must not probe credits for a subscription lane")
 
     monkeypatch.setattr(pl, "_paid_lane_alive", boom)
-    pl._STATE["last_turn"] = None
+    _reset_decisions()
     kw = _kwargs(provider="opencode-go", model="glm-5.3-flash")
     kw["turn_id"] = "oc-2"
     out = pl.on_llm_request(**kw)
@@ -238,7 +244,7 @@ def test_send_excerpt_false_keeps_excerpt_out_of_log(monkeypatch):
     monkeypatch.setattr(pl, "_load_config", lambda: _cfg(mode="live", send_excerpt=False))
     monkeypatch.setattr(pl, "_classify", lambda feats, cfg: ("free", 0.99))
     monkeypatch.setattr(pl, "_log", recs.append)
-    pl._STATE["last_turn"] = None
+    _reset_decisions()
     out = pl.on_llm_request(**_kwargs(turn_id="sx-1",
                                       messages=[{"role": "user",
                                                  "content": "SECRETTEXT"}]))
@@ -254,7 +260,7 @@ def test_send_excerpt_true_includes_excerpt_in_log(monkeypatch):
     monkeypatch.setattr(pl, "_load_config", lambda: _cfg(mode="live", send_excerpt=True))
     monkeypatch.setattr(pl, "_classify", lambda feats, cfg: ("free", 0.99))
     monkeypatch.setattr(pl, "_log", recs.append)
-    pl._STATE["last_turn"] = None
+    _reset_decisions()
     pl.on_llm_request(**_kwargs(turn_id="sx-2",
                                 messages=[{"role": "user", "content": "VISIBLETEXT"}]))
     assert recs and recs[-1]["features"].get("task_excerpt") == "VISIBLETEXT"
@@ -277,7 +283,7 @@ def test_live_mode_rewrites_eligible_request(monkeypatch):
     monkeypatch.setattr(pl, "_load_config", lambda: _cfg(mode="live"))
     monkeypatch.setattr(pl, "_classify", lambda feats, cfg: ("free", 0.70))
     monkeypatch.setattr(pl, "_log", lambda rec: None)
-    pl._STATE["last_turn"] = None
+    _reset_decisions()
     out = pl.on_llm_request(**_kwargs())
     assert out is not None
     assert out["request"]["model"] == "inclusionai/ling-3.0-flash-sante:free"
@@ -290,7 +296,7 @@ def test_shadow_mode_never_rewrites(monkeypatch):
     monkeypatch.setattr(pl, "_load_config", lambda: _cfg(mode="shadow"))
     monkeypatch.setattr(pl, "_classify", lambda feats, cfg: ("free", 0.99))
     monkeypatch.setattr(pl, "_log", lambda rec: None)
-    pl._STATE["last_turn"] = None
+    _reset_decisions()
     assert pl.on_llm_request(**_kwargs()) is None
 
 
@@ -298,7 +304,7 @@ def test_below_gate_never_rewrites(monkeypatch):
     monkeypatch.setattr(pl, "_load_config", lambda: _cfg(mode="live"))
     monkeypatch.setattr(pl, "_classify", lambda feats, cfg: ("free", 0.40))
     monkeypatch.setattr(pl, "_log", lambda rec: None)
-    pl._STATE["last_turn"] = None
+    _reset_decisions()
     assert pl.on_llm_request(**_kwargs()) is None
 
 
@@ -306,7 +312,7 @@ def test_paid_pool_never_rewrites(monkeypatch):
     monkeypatch.setattr(pl, "_load_config", lambda: _cfg(mode="live"))
     monkeypatch.setattr(pl, "_classify", lambda feats, cfg: ("paid", 0.99))
     monkeypatch.setattr(pl, "_log", lambda rec: None)
-    pl._STATE["last_turn"] = None
+    _reset_decisions()
     assert pl.on_llm_request(**_kwargs()) is None
 
 
@@ -315,7 +321,7 @@ def test_followup_calls_are_untouched(monkeypatch):
     monkeypatch.setattr(pl, "_load_config", lambda: _cfg(mode="live"))
     monkeypatch.setattr(pl, "_classify", lambda feats, cfg: ("free", 0.99))
     monkeypatch.setattr(pl, "_log", lambda rec: None)
-    pl._STATE["last_turn"] = None
+    _reset_decisions()
     assert pl.on_llm_request(**_kwargs(api_call_count=3)) is None
 
 
@@ -323,9 +329,9 @@ def test_ineligible_provider_is_skipped_and_logged(monkeypatch):
     recs = []
     monkeypatch.setattr(pl, "_load_config", lambda: _cfg(mode="live"))
     monkeypatch.setattr(pl, "_log", recs.append)
-    pl._STATE["last_turn"] = None
+    _reset_decisions()
     out = pl.on_llm_request(**_kwargs(provider="opencode-go",
-                                      model="longcat-2.5-preview-free"))
+                                      model="longcat-2.5-preview-paid"))
     assert out is None
     assert recs and recs[0]["skip_reason"] == "provider_not_eligible"
 
@@ -335,7 +341,7 @@ def test_already_free_model_never_rerouted(monkeypatch):
     monkeypatch.setattr(pl, "_load_config", lambda: _cfg(
         mode="live", route_models=["inclusionai/ling-3.0-flash-sante:free"]))
     monkeypatch.setattr(pl, "_log", recs.append)
-    pl._STATE["last_turn"] = None
+    _reset_decisions()
     pl.on_llm_request(**_kwargs(model="inclusionai/ling-3.0-flash-sante:free"))
     assert recs and recs[0]["skip_reason"] == "already_free_tier"
 
@@ -349,7 +355,7 @@ def test_classify_failure_is_fail_open(monkeypatch):
         raise RuntimeError("vendor down")
 
     monkeypatch.setattr(pl, "_classify", boom)
-    pl._STATE["last_turn"] = None
+    _reset_decisions()
     assert pl.on_llm_request(**_kwargs()) is None
 
 

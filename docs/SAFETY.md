@@ -85,7 +85,9 @@ text ever leaves the machine or reaches the log file.
 ## What it never does
 
 - Never rewrites a request in shadow mode (default).
-- Never routes a tool-loop follow-up call (first call of a turn only).
+- Never re-classifies a follow-up call: each turn is classified once and
+  the stored decision (including "no rewrite") is re-applied on later
+  calls of the same turn.
 - Never sends a rewrite to a different provider than the request came from.
 - Never reads `~/.hermes/.env` or any secrets file directly.
 - Never logs or transmits the API key values.

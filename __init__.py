@@ -19,8 +19,11 @@ WHY MIDDLEWARE (not a cron, not a skill)
 SAFETY CONTRACT (every one of these is enforced in code, not convention)
     * Fail-open: any exception, timeout, or malformed answer returns None so
       Hermes proceeds with the ORIGINAL request, byte-identical.
-    * First call of the turn only — tool-loop follow-ups keep whatever model the
-      turn started with, so a turn never changes model mid-conversation.
+    * Classified once per turn — the decision (including "no rewrite") is
+      stored and re-applied on every later callback of the same turn, so the
+      host rebuilding its kwargs between attempts can never silently revert a
+      rewrite mid-turn. Re-application never re-classifies and never crosses
+      providers.
     * Only eligible lanes are touched (route_providers/route_models and
       escalate_providers/escalate_models in config); a turn already on the
       free tier, on another provider, or with no model field is left alone.
@@ -36,6 +39,7 @@ SAFETY CONTRACT (every one of these is enforced in code, not convention)
 Config: ~/.hermes/jev/lane2_config.json       Log: ~/.hermes/jev/lane2-live.jsonl
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -44,6 +48,7 @@ import sys
 import threading
 import time
 import urllib.request
+from collections import OrderedDict
 
 logger = logging.getLogger(__name__)
 
@@ -77,10 +82,19 @@ _FREE_HINTS = (":free", "free", "space-bunny")
 # do not escalate — the turn keeps the affordable rung.
 CREDIT_PROBE_MODEL = "z-ai/glm-5.3-flash"
 CREDIT_TTL_S = 300          # don't probe on every turn
-_CREDIT = {"ok": None, "checked_at": 0.0}
+_CREDIT = {"ok": None, "checked_at": 0.0, "identity": None}
 _CREDIT_LOCK = threading.Lock()
-_STATE = {"last_turn": None}
-_STATE_LOCK = threading.Lock()
+
+# TURN DECISION CACHE — the P1 fix. The host rebuilds the provider kwargs from
+# the agent's configured model and re-runs the llm_request middleware chain on
+# EVERY attempt of a turn (in-attempt retries and tool-loop follow-ups), so a
+# rewrite that fires only on the first call would silently revert. Instead:
+# classify once per (session, turn), store the RESOLVED decision, and re-apply
+# it on every later callback.
+_DECISIONS = OrderedDict()            # "session_id:turn_id" -> decision dict
+_DECISIONS_LOCK = threading.Lock()
+_DECISIONS_MAX = 256                  # evict oldest (LRU)
+_DECISIONS_TTL_S = 3600               # expiry; expired => behave as unknown (fail-open)
 
 # Resolved lazily; the vendored client lives in the plugin's own scripts/ dir.
 _JC = None
@@ -117,19 +131,28 @@ def _nous_base_url():
 def _paid_lane_alive():
     """True if a cheap paid call succeeds. Cached CREDIT_TTL_S. Fail-CLOSED:
     unknown => False => do not escalate (stay on the affordable rung)."""
-    now = time.time()
+    key = _nous_api_key()
+    if not key:
+        return False
+    base_url = _nous_base_url().rstrip("/")
+    # A cached probe only describes this endpoint, credential and probe model.
+    # Keep one bounded entry and never retain the plaintext credential in it.
+    identity = hashlib.sha256(json.dumps(
+        [base_url, key, CREDIT_PROBE_MODEL], separators=(",", ":")
+    ).encode()).hexdigest()
+    now = time.monotonic()
     with _CREDIT_LOCK:
-        if _CREDIT["ok"] is not None and (now - _CREDIT["checked_at"]) < CREDIT_TTL_S:
+        if (_CREDIT.get("identity") == identity and _CREDIT["ok"] is not None
+                and (now - _CREDIT["checked_at"]) < CREDIT_TTL_S):
             return _CREDIT["ok"]
     alive = False
     try:
-        key = _nous_api_key()
         if key:
             body = json.dumps({"model": CREDIT_PROBE_MODEL,
                                "messages": [{"role": "user", "content": "ping"}],
                                "max_tokens": 2, "temperature": 0}).encode()
             req = urllib.request.Request(
-                _nous_base_url() + "/chat/completions",
+                base_url + "/chat/completions",
                 data=body, headers={"Content-Type": "application/json",
                                     "Authorization": "Bearer " + key})
             with urllib.request.urlopen(req, timeout=15) as r:
@@ -139,7 +162,8 @@ def _paid_lane_alive():
         logger.debug("credit probe failed (fail-closed, no escalation): %s", e)
     with _CREDIT_LOCK:
         _CREDIT["ok"] = alive
-        _CREDIT["checked_at"] = now
+        _CREDIT["checked_at"] = time.monotonic()
+        _CREDIT["identity"] = identity
     return alive
 
 
@@ -274,27 +298,93 @@ def on_llm_request(**kwargs):
         provider = str(kwargs.get("provider") or "")
         model = str(kwargs.get("model") or request.get("model") or "")
         turn_id = str(kwargs.get("turn_id") or "")
+        session_id = str(kwargs.get("session_id") or "")
         api_call_count = kwargs.get("api_call_count")
 
         # Every invocation records a decision with a skip_reason, so an operator
         # can always answer "why didn't this turn route?" from the log alone.
         def _skip(reason):
             _log({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "turn_id": turn_id,
-                  "session_id": str(kwargs.get("session_id") or ""),
+                  "session_id": session_id,
                   "provider": provider, "model": model, "pool": None,
                   "confidence": None, "gate": None, "eligible": False,
                   "mode": str(cfg.get("mode", "shadow")).lower(),
                   "applied": False, "skip_reason": reason})
             return None
 
+        # ---- TURN DECISION CACHE (P1) ------------------------------------
+        # The host re-runs this middleware on every attempt of the turn
+        # (retries and tool-loop follow-ups rebuild the kwargs from the
+        # agent's configured model each time), so a decision made on the first
+        # call must be re-applied
+        # on all later callbacks or the turn silently reverts to the source
+        # model. Lookup BEFORE the first-call gate: follow-ups route through
+        # the stored decision; only true first calls classify.
+        key = f"{session_id}:{turn_id}"
+        with _DECISIONS_LOCK:
+            now = time.monotonic()
+            for k in [k for k, v in _DECISIONS.items()
+                      if (now - v["ts"]) >= _DECISIONS_TTL_S]:
+                del _DECISIONS[k]
+            while len(_DECISIONS) > _DECISIONS_MAX:
+                _DECISIONS.popitem(last=False)  # evict oldest (LRU)
+            known = _DECISIONS.get(key)
+            if known is not None:
+                # Refresh recency so an active turn is not LRU-evicted mid-flight.
+                _DECISIONS[key] = known
+                _DECISIONS.move_to_end(key)
+
+        if known is not None:
+            # Established decision: never classify again, never recompute
+            # eligibility, and NEVER route across providers.
+            if provider != known["provider"]:
+                return None
+            if str(cfg.get("mode", "shadow")).lower() != "live":
+                return None  # shadow: follow-ups never rewritten, no extra rows
+            decision = known["decision"]
+            if decision == "free":
+                target = known["target"]
+                if not target:
+                    return None  # fail-open defensive: never rewrite to ''
+                updated = dict(request)
+                updated["model"] = target
+                _log({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                      "turn_id": turn_id, "session_id": session_id,
+                      "provider": provider, "model": model, "target": target,
+                      "applied": True, "reapply": True,
+                      "api_call_count": api_call_count})
+                return {"request": updated, "source": "jev-lane2-router",
+                        "reason": "reapply: free tier"}
+            if decision == "paid":
+                target = known["target"]
+                if not target:
+                    return None  # fail-open defensive: never rewrite to ''
+                # Re-check the credit gate on every re-apply: cheap (TTL-cached)
+                # and fail-closed — a lane that went dark mid-turn must not
+                # receive a doomed premium rewrite.
+                if cfg.get("credit_probe", True) and provider == "nous" \
+                        and not _paid_lane_alive():
+                    _log({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                          "turn_id": turn_id, "session_id": session_id,
+                          "provider": provider, "model": model,
+                          "applied": False, "credit_lost": True})
+                    return None
+                updated = dict(request)
+                updated["model"] = target
+                _log({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                      "turn_id": turn_id, "session_id": session_id,
+                      "provider": provider, "model": model, "target": target,
+                      "applied": True, "reapply": True,
+                      "api_call_count": api_call_count})
+                return {"request": updated, "source": "jev-lane2-router",
+                        "reason": "reapply: premium"}
+            return None  # decision "none": below-gate/credit-blocked first call
+
         # First provider call of the turn only. Hermes counts the first call as
-        # 1, so accept 0/1/None — tool-loop follow-ups are 2+ and must keep the
-        # model the turn started with.
+        # 1, so accept 0/1/None — later callbacks carry a stored decision and
+        # were handled above; an unknown turn here is a true first attempt.
         if api_call_count not in (0, 1, None):
             return None  # follow-up call: intentionally unlogged (would flood)
-        with _STATE_LOCK:
-            if turn_id and _STATE["last_turn"] == turn_id:
-                return None
 
         # The two paths have INDEPENDENT eligibility. Checking them as one chain
         # was a real bug: the free path's route_models filter rejected the mid
@@ -305,12 +395,15 @@ def on_llm_request(**kwargs):
         esc_src = (bool(cfg.get("escalate_enabled", True))
                    and provider in (cfg.get("escalate_providers") or [])
                    and model in (cfg.get("escalate_models") or []))
+        # An already-free source must log already_free_tier (not
+        # model_not_eligible) even when route_models does not list it, so this
+        # check runs BEFORE the eligibility chain below.
+        if any(h in model.lower() for h in _FREE_HINTS):
+            return _skip("already_free_tier")
         if not (free_src or esc_src):
             if provider not in (cfg.get("route_providers") or []):
                 return _skip("provider_not_eligible")
             return _skip("model_not_eligible")
-        if any(h in model.lower() for h in _FREE_HINTS):
-            return _skip("already_free_tier")
         if not request.get("model"):
             return _skip("no_model_in_request")
 
@@ -318,8 +411,6 @@ def on_llm_request(**kwargs):
                                                              DEFAULT_EXCERPT_CHARS)),
                           include_excerpt=bool(cfg.get("send_excerpt", True)))
         pool, confidence = _classify(feats, cfg)
-        with _STATE_LOCK:
-            _STATE["last_turn"] = turn_id
 
         gate = float(cfg.get("confidence_gate", DEFAULT_GATE))
         free_model = _rung(cfg, provider, "free", "free_model")
@@ -349,10 +440,19 @@ def on_llm_request(**kwargs):
             if not credit_ok:
                 esc_eligible = False
 
+        # Store the RESOLVED decision for EVERY classified turn (incl. "none":
+        # below-gate / not-eligible / credit-blocked) so retries and follow-ups
+        # never re-classify and re-application stays deterministic.
+        _store_decision(key, provider, "free" if eligible else
+                        ("paid" if esc_eligible else "none"),
+                        free_model if eligible else
+                        (premium if esc_eligible else None),
+                        float(confidence) if confidence is not None else 0.0)
+
         log_feats = feats if cfg.get("send_excerpt", True) else {
             k: v for k, v in feats.items() if k != "task_excerpt"}
         _log({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "turn_id": turn_id,
-              "session_id": str(kwargs.get("session_id") or ""),
+              "session_id": session_id,
               "provider": provider, "model": model, "pool": pool,
               "confidence": confidence, "gate": gate, "eligible": eligible,
               "mode": mode, "applied": bool(eligible and mode == "live"),
@@ -384,6 +484,25 @@ def on_llm_request(**kwargs):
     except Exception as e:
         logger.warning("kfchow-llm-value-router failed open: %s", e)
         return None
+
+
+def _store_decision(key, provider, decision, target, conf):
+    """Record the classified decision for a turn (called AFTER _classify).
+
+    Every classified turn gets a row — "free"/"paid" carry the resolved target;
+    "none" covers below-gate, not-eligible and credit-blocked outcomes so a
+    retry never re-classifies. All state access happens under _DECISIONS_LOCK.
+    """
+    try:
+        with _DECISIONS_LOCK:
+            _DECISIONS[key] = {"decision": decision, "target": target,
+                               "conf": conf, "provider": provider,
+                               "ts": time.monotonic()}
+            _DECISIONS.move_to_end(key)
+            while len(_DECISIONS) > _DECISIONS_MAX:
+                _DECISIONS.popitem(last=False)  # evict oldest (LRU)
+    except Exception:
+        pass  # state must never break a turn
 
 
 def register(ctx):

@@ -15,8 +15,10 @@ Developer: KFChow <hotline@kfchow.com> · License: MIT
 
 ## What it does
 
-On the **first provider call of each turn** (tool-loop follow-ups are ignored
-so a turn never changes model mid-conversation), the plugin:
+On the **first provider call of each turn** the plugin classifies the turn
+once; the stored decision (including "no rewrite") is re-applied on every
+later call of the same turn — tool-loop follow-ups and in-attempt retries
+keep the routed model instead of silently reverting. The plugin:
 
 1. checks eligibility — only providers/models you list in the config are ever
    touched, and a turn already on a free-tier model is never re-routed;
