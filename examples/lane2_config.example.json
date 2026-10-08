@@ -4,16 +4,28 @@
   "confidence_gate": 0.65,
   "feed_url": "https://kfchow.com/llm-value-leaderboard/feed.xml",
   "rungs_path": "~/.hermes/jev/llm_rungs.json",
-  "route_providers": ["nous"],
-  "route_models": ["z-ai/glm-5.3-flash", "glm-5.3-flash"],
+  "route_providers": [
+    "nous"
+  ],
+  "route_models": [
+    "z-ai/glm-5.3-flash",
+    "glm-5.3-flash"
+  ],
   "free_model": "",
   "flash_gate": 0.35,
   "flash_model": "",
   "escalate_enabled": true,
-  "escalate_providers": ["nous"],
-  "escalate_models": ["z-ai/glm-5.3", "glm-5.3"],
+  "escalate_providers": [
+    "nous"
+  ],
+  "escalate_models": [
+    "z-ai/glm-5.3",
+    "glm-5.3",
+    "z-ai/glm-5.3-flash",
+    "glm-5.3-flash"
+  ],
   "premium_model": "",
-  "escalate_confidence_gate": 0.80,
+  "escalate_confidence_gate": 0.8,
   "credit_probe": true,
   "send_excerpt": true,
   "excerpt_chars": 1200,
