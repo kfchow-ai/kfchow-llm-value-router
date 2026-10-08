@@ -1,6 +1,6 @@
 name: kfchow-llm-value-router
-version: "1.0.6"
-description: "Per-turn LLM model routing guided by the KFChow value leaderboard. On the first provider call of a turn, a vendor classifier picks a tier on a 4-rung ladder (free / flash / mid / premium) and in live mode rewrites the request model to that tier's rung. Fail-open, shadow-by-default."
+version: "1.0.7"
+description: "Per-turn LLM model routing guided by the KFChow value leaderboard. On the first provider call of a turn, a vendor classifier picks a tier on a 4-rung ladder (free / flash / mid / premium) and in live mode rewrites the request model to that tier's rung. Source-agnostic: works from any default model (premium, mid, flash or foreign), moving both up and down its own provider's rungs. Fail-open, shadow-by-default."
 author: KFChow
 license: MIT
 requires_hermes: ">=0.21.5"
@@ -34,9 +34,13 @@ config_schema:
   route_providers:
     type: list
     description: "Providers eligible for the free-tier downgrade path."
+  source_mode:
+    type: str
+    default: any
+    description: "Which SOURCE models are eligible (v1.0.7). any = provider match only, so any default model moves both ways on its own provider's rungs (route_models/escalate_models ignored); allowlist = exact v1.0.6 behaviour (source must be in route_models or escalate_models); a JSON list of model ids in lane2_config.json = only those exact sources. Unrecognised values fall back to allowlist with one warning."
   route_models:
     type: list
-    description: "Model ids eligible for the free-tier downgrade path."
+    description: "Model ids eligible for the free-tier downgrade path (consulted only when source_mode is allowlist)."
   free_model:
     type: str
     description: "Flat free-tier fallback rung (per-provider rungs take precedence)."
@@ -56,7 +60,7 @@ config_schema:
     description: "Providers eligible for escalation (must match the turn's originating provider)."
   escalate_models:
     type: list
-    description: "Mid-rung model ids eligible for escalation."
+    description: "Mid-rung model ids eligible for escalation (consulted only when source_mode is allowlist)."
   premium_model:
     type: str
     description: "Flat premium fallback rung (per-provider rungs take precedence)."

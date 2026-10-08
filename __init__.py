@@ -37,9 +37,15 @@ SAFETY CONTRACT (every one of these is enforced in code, not convention)
       host rebuilding its kwargs between attempts can never silently revert a
       rewrite mid-turn. Re-application never re-classifies and never crosses
       providers.
-    * Only eligible lanes are touched (route_providers/route_models and
-      escalate_providers/escalate_models in config); a turn already on the
-      free tier, on another provider, or with no model field is left alone.
+    * Only eligible lanes are touched. v1.0.7 SOURCE-AGNOSTIC ELIGIBILITY: a
+      turn is eligible when its PROVIDER is listed (route_providers /
+      escalate_providers) — whatever default model the user runs, so a
+      premium- or foreign-default install gets the same two-way ladder as a
+      flash-default one. `source_mode` ("any" default | "allowlist" = exact
+      v1.0.6 model allowlists | explicit list of model ids) narrows it. A turn
+      already on a free model (_FREE_HINTS, checked FIRST), on another
+      provider, or with no model field is left alone, and a turn is never
+      rewritten to the model it is already on.
     * The rewritten request keeps every other key, including the message list,
       so the provider payload stays valid.
     * A rewrite NEVER crosses providers: the rungs are resolved per provider,
@@ -83,6 +89,10 @@ DEFAULT_EXCERPT_CHARS = 1200
 # and never a downgrade of a paid-pool verdict (those stay mid below the
 # escalation gate). Below the flash gate: mid (no rewrite).
 DEFAULT_FLASH_GATE = 0.35
+# SOURCE-AGNOSTIC LADDER (v1.0.7): eligibility is provider-match only, so any
+# default model (premium, mid, flash, foreign) moves both up and down its own
+# provider's rungs. "allowlist" restores the v1.0.6 model-allowlist gate.
+DEFAULT_SOURCE_MODE = "any"
 
 # Same pool semantics as the offline measurement, so live decisions are
 # comparable to the data that justified them.
@@ -195,6 +205,10 @@ def _load_config():
     cfg = {"enabled": True, "mode": "shadow", "confidence_gate": DEFAULT_GATE,
            "route_providers": ["nous"],
            "route_models": [],
+           # v1.0.7: "any" = provider-match eligibility (source-agnostic);
+           # "allowlist" = v1.0.6 (route_models/escalate_models gate the
+           # source model); a list of model ids = those exact sources only.
+           "source_mode": DEFAULT_SOURCE_MODE,
            "free_model": "",
            "flash_gate": DEFAULT_FLASH_GATE,
            "escalate_enabled": True,
@@ -226,6 +240,69 @@ def _rung(cfg, provider, key, fallback_key):
     if val in (None, [], ""):
         val = cfg.get(fallback_key)
     return val
+
+
+_WARNED_SOURCE_MODES = set()
+
+
+def _warn_bad_source_mode(mode):
+    """One warning per distinct bad value: a typo'd source_mode must be visible
+    (a silently narrowed router is the 'dead rung' class of bug), but the
+    middleware runs every turn, so never log it more than once."""
+    key = repr(mode)
+    if key not in _WARNED_SOURCE_MODES:
+        _WARNED_SOURCE_MODES.add(key)
+        logger.warning(
+            "kfchow-llm-value-router: unrecognised source_mode %s; falling "
+            "back to 'allowlist' (v1.0.6 semantics). Use 'any', 'allowlist' "
+            "or a list of model ids.", key)
+
+
+def _source_eligibility(cfg, provider, model):
+    """(free_src, esc_src): which lanes this turn's SOURCE may use (v1.0.7).
+
+    A provider match is ALWAYS required (a rewrite never crosses providers);
+    `source_mode` then decides how the SOURCE MODEL is treated:
+      * "any" (default; also unset / null / ""): provider match only. Whatever
+        the user's default model is, both directions of the ladder are open
+        (route_models / escalate_models are ignored).
+      * "allowlist": exact v1.0.6 semantics. The free lane needs
+        model in route_models, the escalation lane needs
+        model in escalate_models.
+      * a LIST of model ids: only those exact source models are eligible, on
+        both lanes (route_models / escalate_models are ignored). An empty
+        list therefore makes nothing eligible, like an empty v1.0.6 allowlist.
+    An unrecognised value falls back to "allowlist": the conservative side of
+    the fail-open contract (it touches fewer turns, never more).
+    """
+    route_ok = provider in (cfg.get("route_providers") or [])
+    esc_ok = (bool(cfg.get("escalate_enabled", True))
+              and provider in (cfg.get("escalate_providers") or []))
+    mode = cfg.get("source_mode", DEFAULT_SOURCE_MODE)
+    if isinstance(mode, (list, tuple, set)):
+        allowed = {str(m) for m in mode}
+        return (route_ok and model in allowed), (esc_ok and model in allowed)
+    mode = str(DEFAULT_SOURCE_MODE if mode is None else mode).strip().lower()
+    if mode in ("", "any"):
+        return route_ok, esc_ok
+    if mode != "allowlist":
+        _warn_bad_source_mode(cfg.get("source_mode"))
+    # "allowlist", or anything unrecognised: v1.0.6 behaviour.
+    return (route_ok and model in (cfg.get("route_models") or [])), \
+           (esc_ok and model in (cfg.get("escalate_models") or []))
+
+
+def _same_model(a, b):
+    """True if two model ids name the same model (case-insensitive, and tolerant
+    of a vendor prefix: 'z-ai/glm-5.3' == 'glm-5.3'). Used so a turn is never
+    'moved' onto the model it is already on (e.g. a sonnet-default user being
+    'escalated' to sonnet). A false positive only skips a rewrite — the
+    fail-open direction. Empty ids never match."""
+    a = str(a or "").strip().lower()
+    b = str(b or "").strip().lower()
+    if not a or not b:
+        return False
+    return a == b or a.rsplit("/", 1)[-1] == b.rsplit("/", 1)[-1]
 
 
 def _log(rec):
@@ -430,16 +507,17 @@ def on_llm_request(**kwargs):
         # was a real bug: the free path's route_models filter rejected the mid
         # model before escalation ever ran, so escalation could never fire.
         # Evaluate each path on its own lane.
-        free_src = (provider in (cfg.get("route_providers") or [])
-                    and model in (cfg.get("route_models") or []))
-        esc_src = (bool(cfg.get("escalate_enabled", True))
-                   and provider in (cfg.get("escalate_providers") or [])
-                   and model in (cfg.get("escalate_models") or []))
-        # An already-free source must log already_free_tier (not
-        # model_not_eligible) even when route_models does not list it, so this
-        # check runs BEFORE the eligibility chain below.
+        # _FREE_HINTS guard runs FIRST, ahead of every eligibility rule: a
+        # source already on a free model is never rewritten (logs
+        # already_free_tier, not *_not_eligible), whatever source_mode says.
         if any(h in model.lower() for h in _FREE_HINTS):
             return _skip("already_free_tier")
+        # v1.0.7 SOURCE-AGNOSTIC: eligibility is PROVIDER-match only by
+        # default (source_mode "any"), so a premium-, mid-, flash- or
+        # foreign-default user all get both directions of the ladder.
+        # route_models / escalate_models only gate when source_mode is
+        # "allowlist" (exact v1.0.6); a list value pins explicit sources.
+        free_src, esc_src = _source_eligibility(cfg, provider, model)
         if not (free_src or esc_src):
             if provider not in (cfg.get("route_providers") or []):
                 return _skip("provider_not_eligible")
@@ -470,9 +548,13 @@ def on_llm_request(**kwargs):
         except (TypeError, ValueError):
             flash_gate = DEFAULT_FLASH_GATE
         flash_model = _rung(cfg, provider, "flash", "flash_model")
-        flash_eligible = (pool == "free" and confidence is not None
-                          and flash_gate <= float(confidence) < gate
-                          and bool(flash_model))
+        flash_band = (pool == "free" and confidence is not None
+                      and flash_gate <= float(confidence) < gate
+                      and bool(flash_model))
+        # v1.0.7 identity guard: a turn is never "moved" onto the model it is
+        # already on (a flash-default user IS on the flash rung). The band
+        # fired, but there is nothing to rewrite: stay on the source model.
+        flash_eligible = flash_band and not _same_model(flash_model, model)
 
         # ---- ESCALATION (mid -> premium), the other direction -------------
         # Fires when the turn is on a MID rung and the classifier says it needs
@@ -487,10 +569,14 @@ def on_llm_request(**kwargs):
         esc_gate = float(esc_gate_raw if esc_gate_raw is not None
                          else DEFAULT_GATE)
         premium = _rung(cfg, provider, "premium", "premium_model")
-        esc_eligible = (
+        esc_band = (
             esc_src
             and pool == "paid" and confidence is not None
             and float(confidence) >= esc_gate and bool(premium))
+        # v1.0.7 identity guard: a premium-default user (source == premium
+        # rung) is already at the top of the ladder. Never "escalate" to
+        # itself, and never spend a credit probe deciding to do so.
+        esc_eligible = esc_band and not _same_model(premium, model)
         credit_ok = None
         # Only a METERED provider needs the credit probe. A flat-rate
         # subscription lane has no per-call credit wall, and probing it with a
@@ -504,9 +590,16 @@ def on_llm_request(**kwargs):
         # 41 measured target turns are mid-model sources listed under the
         # escalation lane, not route_models, and their free-pool verdicts
         # below the gate are exactly the band the flash tier serves.
-        eligible = ((free_src or esc_src) and pool == "free"
-                    and confidence is not None and float(confidence) >= gate
-                    and bool(free_model))
+        free_band = ((free_src or esc_src) and pool == "free"
+                     and confidence is not None and float(confidence) >= gate
+                     and bool(free_model))
+        eligible = free_band and not _same_model(free_model, model)
+        # True when a tier fired but its rung IS the source model (identity
+        # guard above): logged as already_on_target, nothing rewritten.
+        on_target = bool(
+            (free_band and not eligible)
+            or (flash_band and not flash_eligible)
+            or (esc_band and _same_model(premium, model)))
 
         # Store the RESOLVED decision for EVERY classified turn (incl. "none":
         # below-gate / not-eligible / credit-blocked) so retries and follow-ups
@@ -529,7 +622,8 @@ def on_llm_request(**kwargs):
               "applied": bool((eligible or flash_eligible) and mode == "live"),
               "tier": decision if decision != "none" else "mid",
               "skip_reason": None if (eligible or flash_eligible or esc_eligible) else (
-                  "below_gate" if pool == "free" else "pool_paid"),
+                  "already_on_target" if on_target else (
+                      "below_gate" if pool == "free" else "pool_paid")),
               "escalate_eligible": esc_eligible,
               "escalate_applied": bool(esc_eligible and mode == "live"),
               "flash_model": flash_model if flash_eligible else None,

@@ -20,8 +20,10 @@ once; the stored decision (including "no rewrite") is re-applied on every
 later call of the same turn — tool-loop follow-ups and in-attempt retries
 keep the routed model instead of silently reverting. The plugin:
 
-1. checks eligibility — only providers/models you list in the config are ever
-   touched, and a turn already on a free-tier model is never re-routed;
+1. checks eligibility — only providers you list in the config are ever
+   touched (whatever default model you run, see *Source-agnostic ladder*
+   below), a turn already on a free-tier model is never re-routed, and a turn
+   is never "moved" onto the model it is already on;
 2. asks a vendor classifier (TypeSafe "Jev", a 3–10s bounded call) which pool
    the turn belongs to (routine vs strong) and how confident it is;
 3. in `shadow` mode (default): records the decision and leaves the request
@@ -53,6 +55,29 @@ tier, and host retry/fail-open covers a flash 404. Escalation defaults to the
 Model rungs come from the KFChow value leaderboard (https://kfchow.com/llm)
 via the bundled resolver script — never hardcoded — because rankings update
 twice daily and free-tier model ids expire silently.
+
+### Source-agnostic ladder (v1.0.7)
+
+The ladder moves **both ways from whatever default model you run**: a premium-,
+mid-, flash- or foreign-default install gets the same tiers on its own
+provider's rungs, so a flash-default install is never left with a dead premium
+rung. Eligibility is **provider match only**; `source_mode` narrows it:
+
+| `source_mode` | eligible source models |
+|---|---|
+| `"any"` (default; also unset / null / empty) | every model on a listed provider (`route_providers` / `escalate_providers`); `route_models` / `escalate_models` are ignored |
+| `"allowlist"` | exact v1.0.6 behaviour: the source must be listed in `route_models` (free lane) or `escalate_models` (escalation lane) |
+| `["model-a", "model-b"]` | only those exact source models, on both lanes; `route_models` / `escalate_models` are ignored |
+
+An unrecognised value falls back to `"allowlist"` (the conservative side: it
+touches fewer turns, never more) and logs one warning per distinct value.
+
+Guards that hold in every mode: a source already on a free model (`:free`,
+`free`, `space-bunny`) is never rewritten (logged `already_free_tier`); a
+paid-pool verdict below the escalation gate never downgrades; and a turn is
+never moved onto the model it is already on — a premium-default turn with a
+strong-model verdict stays put (logged `already_on_target`, no credit probe
+spent), as does a flash-default turn inside the flash band.
 
 ## Safety & privacy (full details in [docs/SAFETY.md](docs/SAFETY.md))
 

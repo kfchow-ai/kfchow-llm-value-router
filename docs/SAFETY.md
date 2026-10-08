@@ -16,10 +16,15 @@ Concretely enforced:
 - The whole middleware body is wrapped; an unexpected error logs and returns None.
 - The vendor call is bounded by `jev_timeout_s` (default 10s) with **retries
   disabled** for the routing call — a slow vendor must not stall a turn.
-- Eligibility filters run BEFORE any network call: only providers/models
-  listed in `route_providers`/`route_models` (downgrade) or
-  `escalate_providers`/`escalate_models` (escalation and the flash band) are
-  ever considered.
+- Eligibility filters run BEFORE any network call: only turns on a provider
+  listed in `route_providers` (downgrade) or `escalate_providers`
+  (escalation) are ever considered. v1.0.7 `source_mode` (default `"any"`)
+  decides how the SOURCE model is treated: `"any"` = provider match only (any
+  default model moves both ways on its own provider's rungs); `"allowlist"` =
+  exact v1.0.6 model allowlists (`route_models` / `escalate_models`); or an
+  explicit list of model ids. An unrecognised value falls back to
+  `"allowlist"` (fewer turns touched, never more) with a one-time warning. A
+  source already on a free model is skipped first, in every mode.
 
 ## Shadow-first
 
@@ -96,6 +101,12 @@ text ever leaves the machine or reaches the log file.
   the stored decision (including "no rewrite") is re-applied on later
   calls of the same turn.
 - Never sends a rewrite to a different provider than the request came from.
+- Never rewrites a turn that is already on a free model (`:free`, `free`,
+  `space-bunny`), in any `source_mode`.
+- Never rewrites a turn onto the model it is already on (identity guard,
+  case-insensitive and vendor-prefix tolerant): a premium-default turn is
+  never "escalated" to itself and never spends a credit probe doing so; it is
+  logged `already_on_target`.
 - Never downgrades a paid-pool verdict: below the escalation gate a paid
   turn stays mid; only free-pool turns drop to the flash band.
 - Never reads `~/.hermes/.env` or any secrets file directly.
