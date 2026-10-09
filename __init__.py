@@ -349,19 +349,24 @@ def _kill_switch_off(request):
     if not isinstance(request, dict):
         return False
     # HTTP-header form: names are case-insensitive per RFC, values per spec.
+    def _off(value):
+        # Native JSON scalars: JSON clients send router: false / router: 0, not the
+        # string forms — coerce before the membership check so both wire.
+        if isinstance(value, bool):
+            return value is False  # false disables; true is an on-value
+        if isinstance(value, (int, float)):
+            return value == 0
+        return str(value or "").strip().lower() in KILL_SWITCH_OFF_VALUES
+
     headers = request.get("extra_headers")
     if isinstance(headers, dict):
         for name, value in headers.items():
             if str(name or "").strip().lower() == KILL_SWITCH_HEADER:
-                if str(value or "").strip().lower() in KILL_SWITCH_OFF_VALUES:
-                    return True
-                return False  # recognised flag with a non-disabling value
+                return True if _off(value) else False
     # JSON-body form, for clients that cannot set headers.
     for source in (request.get("metadata"), request):
         if isinstance(source, dict) and "router" in source:
-            if str(source.get("router") or "").strip().lower() in KILL_SWITCH_OFF_VALUES:
-                return True
-            return False
+            return True if _off(source.get("router")) else False
     return False
 
 

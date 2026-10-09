@@ -84,7 +84,3 @@ config_schema:
     type: float
     default: 10
     description: "Vendor classify timeout in seconds; on timeout the turn proceeds unchanged (fail-open)."
-  request_kill_switch:
-    type: str
-    default: "X-KFC-Router"
-    description: "v1.0.8 per-request kill switch. NOT a config value — it is carried ON THE REQUEST by the client: send the header 'X-KFC-Router: off' (or \"metadata\": {\"router\": \"off\"} / \"router\": \"off\" in the JSON body) to disable routing for that request only. Disabling values: off / 0 / false / disable / disabled (case-insensitive; unknown values are ignored, fail-open). The flag only ever turns routing OFF — enabling the plugin stays the 'enabled' key. Both middlewares re-read it on every callback, so a flag set mid-turn also stops re-application of an earlier decision. Affected requests are never rewritten, never classified (no vendor spend), never credit-probed, and get one log row with skip_reason 'disabled_by_request'."
