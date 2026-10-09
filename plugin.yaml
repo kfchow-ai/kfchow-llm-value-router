@@ -1,6 +1,6 @@
 name: kfchow-llm-value-router
-version: "1.0.7"
-description: "Per-turn LLM model routing guided by the KFChow value leaderboard. On the first provider call of a turn, a vendor classifier picks a tier on a 4-rung ladder (free / flash / mid / premium) and in live mode rewrites the request model to that tier's rung. Source-agnostic: works from any default model (premium, mid, flash or foreign), moving both up and down its own provider's rungs. Fail-open, shadow-by-default."
+version: "1.0.8"
+description: "Per-turn LLM model routing guided by the KFChow value leaderboard. On the first provider call of a turn, a vendor classifier picks a tier on a 4-rung ladder (free / flash / mid / premium) and in live mode rewrites the request model to that tier's rung. Source-agnostic: works from any default model (premium, mid, flash or foreign), moving both up and down its own provider's rungs. Per-request kill switch (v1.0.8): a client can disable routing for its own request with the X-KFC-Router header (or a router body field) — no rewrite, no classifier call, no credit probe, one log row. Fail-open, shadow-by-default."
 author: KFChow
 license: MIT
 requires_hermes: ">=0.21.5"
@@ -84,3 +84,7 @@ config_schema:
     type: float
     default: 10
     description: "Vendor classify timeout in seconds; on timeout the turn proceeds unchanged (fail-open)."
+  request_kill_switch:
+    type: str
+    default: "X-KFC-Router"
+    description: "v1.0.8 per-request kill switch. NOT a config value — it is carried ON THE REQUEST by the client: send the header 'X-KFC-Router: off' (or \"metadata\": {\"router\": \"off\"} / \"router\": \"off\" in the JSON body) to disable routing for that request only. Disabling values: off / 0 / false / disable / disabled (case-insensitive; unknown values are ignored, fail-open). The flag only ever turns routing OFF — enabling the plugin stays the 'enabled' key. Both middlewares re-read it on every callback, so a flag set mid-turn also stops re-application of an earlier decision. Affected requests are never rewritten, never classified (no vendor spend), never credit-probed, and get one log row with skip_reason 'disabled_by_request'."

@@ -25,6 +25,12 @@ Concretely enforced:
   explicit list of model ids. An unrecognised value falls back to
   `"allowlist"` (fewer turns touched, never more) with a one-time warning. A
   source already on a free model is skipped first, in every mode.
+- **Per-request kill switch (v1.0.8):** a request that carries the disabling
+  flag (`X-KFC-Router` header or a `router` body field) is skipped FIRST, in
+  both middlewares and on every callback — no rewrite, no classifier call, no
+  credit probe, one log row, no decision stored. An unknown flag value is
+  ignored (fail-open: normal routing, no warning). The flag only turns routing
+  OFF; it can never enable a config-disabled plugin.
 
 ## Shadow-first
 
@@ -100,6 +106,10 @@ text ever leaves the machine or reaches the log file.
 - Never re-classifies a follow-up call: each turn is classified once and
   the stored decision (including "no rewrite") is re-applied on later
   calls of the same turn.
+- Never re-applies a stored decision when the request itself carries the
+  per-request kill-switch flag (v1.0.8): the flag is re-read from the
+  payload on every callback, so a flagged request — even mid-turn — is
+  never rewritten, never classified and never probes credits.
 - Never sends a rewrite to a different provider than the request came from.
 - Never rewrites a turn that is already on a free model (`:free`, `free`,
   `space-bunny`), in any `source_mode`.

@@ -79,6 +79,31 @@ never moved onto the model it is already on — a premium-default turn with a
 strong-model verdict stays put (logged `already_on_target`, no credit probe
 spent), as does a flash-default turn inside the flash band.
 
+## Per-request kill switch (`X-KFC-Router`, v1.0.8)
+
+A client can turn routing OFF for **its own request** — no config edit, no
+restart, zero effect on any other turn. Clients that don't send the flag get
+normal routing (the blast radius of the feature is one request). Two
+interchangeable forms ride on the provider payload:
+
+| Form | Example |
+|---|---|
+| HTTP header | `X-KFC-Router: off` |
+| JSON body | `"metadata": {"router": "off"}` (or the top-level `"router": "off"`) |
+
+Disabling values: `off`, `0`, `false`, `disable`, `disabled` (case-insensitive,
+as is the header name). When the flag is set the router stands down completely:
+no rewrite, **no classifier call** (no Jev spend on a turn you won't route), no
+credit probe, one log row with `skip_reason: "disabled_by_request"` and
+`applied: false`, and **no decision stored** — so a later callback of the turn
+finds nothing to re-apply. An unknown value (`X-KFC-Router: banana`) is ignored
+with no warning; the flag only ever turns routing OFF — the plugin-level switch
+stays the `enabled` config key.
+
+Because the middleware layer re-reads the flag from the payload on **every**
+callback, a flag that appears on a later call of a turn also stops the
+re-application of an earlier decision — the rewrite cannot reappear mid-turn.
+
 ## Safety & privacy (full details in [docs/SAFETY.md](docs/SAFETY.md))
 
 - **Fail-open**: any error/timeout/malformed answer returns `None`; the

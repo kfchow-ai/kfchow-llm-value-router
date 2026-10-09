@@ -5,8 +5,8 @@ authors:
   - name: "KFChow AI Lab"
     email: hotline@kfchow.com
     website: "https://kfchow.com/llm"
-version: 1.0.7
-date-released: "2026-10-08"
+version: 1.0.8
+date-released: "2026-10-09"
 license: MIT
 repository-code: "https://github.com/kfchow-ai/kfchow-llm-value-router"
 url: "https://kfchow.com/llm"

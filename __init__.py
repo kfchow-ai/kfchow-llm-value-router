@@ -14,6 +14,21 @@ WHAT IT DOES
     escalated to the provider's premium rung — guarded by a credit probe so a
     metered provider with an exhausted balance never receives a doomed rewrite.
 
+PER-REQUEST KILL SWITCH (v1.0.8, X-KFC-Router)
+    A client can disable routing for ITS OWN request, without any config edit
+    and without touching other turns. BOTH middlewares read the flag from the
+    request payload on EVERY callback, so a flag set mid-turn stops both the
+    first-call rewrite and the reapply of an earlier decision:
+      * HTTP-header form:  request["extra_headers"]["X-KFC-Router"] = "off"
+      * JSON-body form:    request["metadata"]["router"] = "off"
+                          (or the top-level request["router"] = "off")
+    Disabling values: off / 0 / false / disable / disabled (case-insensitive).
+    When the flag is set: no rewrite, NO classifier call, no credit probe, ONE
+    log row with skip_reason "disabled_by_request", and NO decision stored —
+    the turn stays unknown so nothing re-applies. An unknown value is ignored
+    (fail-open: normal routing, no warning). The flag only turns routing OFF;
+    the plugin-level enable/disable stays the config `enabled` key.
+
 WHY TWO MIDDLEWARE (not a cron, not a skill)
     `llm_request` is the documented cutover path: it sees the full provider
     kwargs and can replace them. A skill is advisory and a cron cannot act on
@@ -48,6 +63,11 @@ SAFETY CONTRACT (every one of these is enforced in code, not convention)
       rewritten to the model it is already on.
     * The rewritten request keeps every other key, including the message list,
       so the provider payload stays valid.
+    * PER-REQUEST KILL SWITCH honoured on every callback: a request carrying
+      the disabling flag (X-KFC-Router header or router body field) is never
+      rewritten, never classified and never stores a decision — read fresh
+      from the payload each time, so a flag set mid-turn also stops the
+      reapply path.
     * A rewrite NEVER crosses providers: the rungs are resolved per provider,
       so the model id sent always belongs to the originating provider's API.
     * Mode is `shadow` until a human flips `mode` to `live` in the config.
@@ -107,6 +127,15 @@ POOL_CRITERIA = {
 
 # A turn already on a free/trial model must never be "routed" again.
 _FREE_HINTS = (":free", "free", "space-bunny")
+
+# PER-REQUEST KILL SWITCH (v1.0.8). A client can disable routing for its own
+# request with NO config edit and zero blast radius on other turns. The flag
+# rides on the provider payload (the only per-request channel the middleware
+# layer sees) in two interchangeable forms:
+#   * request["extra_headers"]["X-KFC-Router"]  — the HTTP-header form
+#   * request["metadata"]["router"] or request["router"] — the JSON-body form
+KILL_SWITCH_HEADER = "x-kfc-router"
+KILL_SWITCH_OFF_VALUES = ("off", "0", "false", "disable", "disabled")
 
 # CREDIT GATE — checked before any escalation to a PAID model on a METERED
 # provider. An account that has run out of credits refuses paid models (with
@@ -305,6 +334,37 @@ def _same_model(a, b):
     return a == b or a.rsplit("/", 1)[-1] == b.rsplit("/", 1)[-1]
 
 
+def _kill_switch_off(request):
+    """True when the REQUEST itself asks the router to stand down (v1.0.8).
+
+    Read FRESH on every middleware callback, from the payload the client sent:
+      * extra_headers["X-KFC-Router"] (header name and value case-insensitive)
+      * metadata["router"] or the top-level request["router"]
+    Disabling values: off / 0 / false / disable / disabled. Everything else
+    — including explicit on-values ("on", "1", "true") and junk like "banana"
+    — is IGNORED (fail-open: route normally, and log nothing about it, so an
+    unrecognised value can never spam a warning per turn). The flag only ever
+    turns routing OFF; enabling the plugin stays the config `enabled` key.
+    """
+    if not isinstance(request, dict):
+        return False
+    # HTTP-header form: names are case-insensitive per RFC, values per spec.
+    headers = request.get("extra_headers")
+    if isinstance(headers, dict):
+        for name, value in headers.items():
+            if str(name or "").strip().lower() == KILL_SWITCH_HEADER:
+                if str(value or "").strip().lower() in KILL_SWITCH_OFF_VALUES:
+                    return True
+                return False  # recognised flag with a non-disabling value
+    # JSON-body form, for clients that cannot set headers.
+    for source in (request.get("metadata"), request):
+        if isinstance(source, dict) and "router" in source:
+            if str(source.get("router") or "").strip().lower() in KILL_SWITCH_OFF_VALUES:
+                return True
+            return False
+    return False
+
+
 def _log(rec):
     try:
         os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
@@ -413,6 +473,16 @@ def on_llm_request(**kwargs):
                   "mode": str(cfg.get("mode", "shadow")).lower(),
                   "applied": False, "skip_reason": reason})
             return None
+
+        # ---- PER-REQUEST KILL SWITCH (v1.0.8) ------------------------------
+        # The client asked for no routing on THIS request. Honoured FIRST,
+        # ahead of the decision cache and every eligibility rule: no rewrite,
+        # no classifier call, no credit probe, one log row, and NO decision
+        # stored — the turn stays unknown so nothing re-applies later in the
+        # turn. Read from the payload on EVERY callback (below at the reapply
+        # path too), because a flag can appear on any call of the turn.
+        if _kill_switch_off(request):
+            return _skip("disabled_by_request")
 
         # ---- TURN DECISION CACHE (P1) ------------------------------------
         # The host re-runs this middleware on every attempt of the turn
@@ -701,6 +771,17 @@ def on_llm_execution(request=None, next_call=None, **context):
     try:
         cfg = _load_config()
         if not cfg.get("enabled", True):
+            return _dispatch(request)
+
+        # ---- PER-REQUEST KILL SWITCH (v1.0.8) ------------------------------
+        # Same flag, same payload, re-read on EVERY callback: a request whose
+        # client asked for no routing is dispatched untouched — no reapply of
+        # an earlier decision, no rewrite, no probe, no extra row (the request
+        # middleware already logged its disabled_by_request row). Placed ahead
+        # of the decision-cache lookup on purpose: without this the stored
+        # rewrite would silently REAPPEAR mid-turn and the kill switch would
+        # only hold for the first call.
+        if _kill_switch_off(request):
             return _dispatch(request)
 
         # Shallow copy: our rewrite must not half-mutate the host's payload
