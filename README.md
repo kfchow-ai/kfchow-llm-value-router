@@ -1,5 +1,5 @@
 # kfchow-llm-value-router
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23186874.svg)](https://doi.org/10.5281/zenodo.23186874)
+[![DOI](assets/doi-badge.svg)](https://doi.org/10.5281/zenodo.23186874)
 
 > **Cite:** KFChow AI Lab (2026). *kfchow-llm-value-router: Jev-driven per-turn model routing for Hermes Agent, resolved from the KFChow AI Lab value leaderboard.* Zenodo. https://doi.org/10.5281/zenodo.23186874
 
