@@ -70,7 +70,11 @@ SAFETY CONTRACT (every one of these is enforced in code, not convention)
       reapply path.
     * A rewrite NEVER crosses providers: the rungs are resolved per provider,
       so the model id sent always belongs to the originating provider's API.
-    * Mode is `shadow` until a human flips `mode` to `live` in the config.
+    * Mode is `live` here, and the real switch is the Desktop plugin-settings
+      panel (v1.0.9): `enabled` / `mode` / `confidence_gate` are read from the
+      plugin-settings store every turn and win over this JSON file, which
+      remains the fallback and the owner of everything else (rungs, gates not
+      exposed in the panel, providers).
     * The llm_execution wrapper calls next_call EXACTLY once per invocation:
       it is the provider call itself. Fail-open covers only OUR code — any
       error from downstream (the provider/next middleware) propagates after
@@ -113,6 +117,16 @@ DEFAULT_FLASH_GATE = 0.35
 # default model (premium, mid, flash, foreign) moves both up and down its own
 # provider's rungs. "allowlist" restores the v1.0.6 model-allowlist gate.
 DEFAULT_SOURCE_MODE = "any"
+
+# PANEL-WIRED SWITCH (v1.0.9). The Desktop plugin-settings panel writes
+# plugins.entries.<id>.settings.<key> into config.yaml — a store the router
+# historically never read, so the panel rendered config_schema defaults and its
+# shadow/live toggle was decorative. These keys are now read from that store on
+# EVERY turn (fresh read, no restart needed) and WIN over lane2_config.json;
+# anything the panel has never saved falls through to lane2_config.json.
+# Fail-open: any settings-read error is ignored and the JSON config stands.
+_PANEL_KEYS = ("enabled", "mode", "confidence_gate")
+_PLUGIN_CTX = None
 
 # Same pool semantics as the offline measurement, so live decisions are
 # comparable to the data that justified them.
@@ -258,6 +272,16 @@ def _load_config():
             cfg.update(json.load(fh) or {})
     except Exception:
         pass  # missing/corrupt config -> conservative defaults
+    # Panel overlay (v1.0.9): the plugin-settings panel is the real switch.
+    ctx = _PLUGIN_CTX
+    if ctx is not None:
+        for key in _PANEL_KEYS:
+            try:
+                val = ctx.get_config(key, None)
+            except Exception:
+                val = None  # fail-open: a broken settings read changes nothing
+            if val is not None:
+                cfg[key] = val
     return cfg
 
 
@@ -917,5 +941,7 @@ def _store_decision(key, provider, decision, target, conf):
 
 
 def register(ctx):
+    global _PLUGIN_CTX
+    _PLUGIN_CTX = ctx  # panel-wired switch (v1.0.9): see _PANEL_KEYS
     ctx.register_middleware("llm_request", on_llm_request)
     ctx.register_middleware("llm_execution", on_llm_execution)
