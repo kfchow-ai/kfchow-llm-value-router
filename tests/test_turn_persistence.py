@@ -608,6 +608,7 @@ def _cfg4(**over):
             "escalate_models": ["z-ai/glm-5.3", "glm-5.3"],
             "premium_model": "anthropic/claude-sonnet-5.5",
             "escalate_confidence_gate": 0.80, "credit_probe": True,
+            "mid_model": "z-ai/glm-5.3",
             "send_excerpt": True}
     base.update(over)
     return base
@@ -708,22 +709,24 @@ def test_flash_band_boundaries(monkeypatch):
     # conf 0.40 -> flash
     out = pl.on_llm_request(**_kw_mid(turn_id="fl-b-1", api_call_count=1))
     assert out is not None and out["request"]["model"] == "z-ai/glm-5.3-flash"
-    # conf 0.30 -> below flash_gate: stay mid, untouched
+    # conf 0.30 -> v1.0.10 routine band: rewritten onto the free rung
     _reset()
     out = pl.on_llm_request(**_kw_mid(turn_id="fl-b-2", api_call_count=1))
-    assert out is None  # no rewrite, stays on the mid rung
-    assert recs[-1]["tier"] == "mid"
-    assert recs[-1]["skip_reason"] == "below_gate"
+    assert out is not None
+    assert out["request"]["model"] == "inclusionai/ling-3.0-flash-sante:free"
+    assert recs[-1]["tier"] == "free"
+    assert recs[-1]["skip_reason"] is None
     # conf 0.35 == flash_gate -> flash (inclusive lower bound)
     _reset()
     out = pl.on_llm_request(**_kw_mid(turn_id="fl-b-3", api_call_count=1))
     assert out is not None and out["request"]["model"] == "z-ai/glm-5.3-flash"
-    # conf 0.65 == free gate -> FREE tier (flash band excludes the upper bound)
+    # conf 0.65 == free gate -> v1.0.10 MID band; the source IS the mid rung
+    # (identity guard) -> already_on_target, nothing rewritten.
     _reset()
     out = pl.on_llm_request(**_kw_mid(turn_id="fl-b-4", api_call_count=1))
-    assert out is not None
-    assert out["request"]["model"] == "inclusionai/ling-3.0-flash-sante:free"
-    assert recs[-1]["tier"] == "free"
+    assert out is None
+    assert recs[-1]["tier"] == "stay"
+    assert recs[-1]["skip_reason"] == "already_on_target"
     assert len(cls.calls) == 4
 
 
@@ -743,7 +746,7 @@ def test_paid_pool_075_stays_mid_no_downgrade(monkeypatch):
     out = pl.on_llm_request(**_kw_mid(turn_id="pd-75-1", api_call_count=1))
     assert out is None  # no escalate at 0.80, no flash, no free rewrite
     row = recs[-1]
-    assert row["tier"] == "mid"
+    assert row["tier"] == "stay"          # v1.0.10: non-decisions log "stay"
     assert row["skip_reason"] == "pool_paid"
     assert row["escalate_eligible"] is False
     # decision stored as "none": the exec follow-up leaves the payload untouched
@@ -776,8 +779,8 @@ def test_tier_key_present_in_rows(monkeypatch):
         req, ctx = _exec_ctx(_kw_mid(turn_id=tid, api_call_count=2))
         pl.on_llm_execution(request=req, next_call=_capture_next([]), **ctx)
     tiers = {r["tier"] for r in recs if "tier" in r}
-    assert {"free", "flash", "paid", "mid"} <= tiers
-    assert all(r.get("tier") in ("free", "flash", "paid", "mid")
+    assert {"free", "flash", "paid"} <= tiers
+    assert all(r.get("tier") in ("free", "flash", "paid", "mid", "stay")
                for r in recs if not r.get("credit_lost"))
     # reapply rows carry the decision's tier
     by_key = {(r.get("turn_id"), r.get("api_call_count")): r for r in recs
@@ -850,7 +853,7 @@ def test_flash_band_without_rung_stays_mid(monkeypatch):
 
     out = pl.on_llm_request(**_kw_mid(turn_id="nfr-1", api_call_count=1))
     assert out is None
-    assert recs[-1]["tier"] == "mid"
+    assert recs[-1]["tier"] == "stay"
     assert recs[-1]["skip_reason"] == "below_gate"
 
 
@@ -868,7 +871,7 @@ def test_escalate_gate_default_is_080(monkeypatch):
     monkeypatch.setattr(pl, "_log", recs.append)
 
     assert pl.on_llm_request(**_kw_mid(turn_id="g80-1", api_call_count=1)) is None
-    assert recs[-1]["tier"] == "mid"
+    assert recs[-1]["tier"] == "stay"
     _reset()
     out = pl.on_llm_request(**_kw_mid(turn_id="g80-2", api_call_count=1))
     assert out is not None

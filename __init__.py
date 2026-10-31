@@ -556,6 +556,21 @@ def on_llm_request(**kwargs):
                       "api_call_count": api_call_count})
                 return {"request": updated, "source": "jev-lane2-router",
                         "reason": "reapply: free tier"}
+            if decision == "mid":
+                # MID re-apply mirrors flash: the mid rung is the stable
+                # workhorse; no credit probe, host fail-open covers a 404.
+                target = known["target"]
+                if not target:
+                    return None  # fail-open defensive: never rewrite to ''
+                updated = dict(request)
+                updated["model"] = target
+                _log({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                      "turn_id": turn_id, "session_id": session_id,
+                      "provider": provider, "model": model, "target": target,
+                      "applied": True, "reapply": True, "tier": "mid",
+                      "api_call_count": api_call_count})
+                return {"request": updated, "source": "jev-lane2-router",
+                        "reason": "reapply: mid tier"}
             if decision == "flash":
                 # FLASH re-apply mirrors free: no credit probe (flash is the
                 # stable workhorse; host retry/fail-open covers a 404).
@@ -685,29 +700,53 @@ def on_llm_request(**kwargs):
             if not credit_ok:
                 esc_eligible = False
 
-        # The FREE tier rides the same eligibility union as escalation: the
-        # 41 measured target turns are mid-model sources listed under the
-        # escalation lane, not route_models, and their free-pool verdicts
-        # below the gate are exactly the band the flash tier serves.
-        free_band = ((free_src or esc_src) and pool == "free"
-                     and confidence is not None and float(confidence) >= gate
-                     and bool(free_model))
-        eligible = free_band and not _same_model(free_model, model)
+        # ---- v1.0.10 MARC BANDING (2026-10-31) ------------------------------
+        # The four confidence bands now map 1:1 to Marc's tiers:
+        #   conf >= esc_gate (0.80): paid pool -> premium rung (unchanged);
+        #                            free pool -> free rung (unchanged: the
+        #                            classifier vouches a free model suffices,
+        #                            never pay $0.75+ to overrule that).
+        #   gate <= conf < esc_gate (0.65-0.80): free pool -> MID RUNG (was the
+        #                            free rung in v1.0.9; Marc's "Mid tier").
+        #                            Paid pool in this band still stays mid.
+        #   flash_gate <= conf < gate (0.35-0.65): free pool -> flash rung
+        #                            (unchanged); paid pool stays mid.
+        #   conf < flash_gate (0.35): FREE RUNG, pool-agnostic (was
+        #                            stay-on-default; Marc: routine turns
+        #                            belong on the $0 model).
+        # The classifier fails open as before: no verdict -> the turn stays on
+        # its source model ("stay", logged).
+        mid_model = _rung(cfg, provider, "mid", "mid_model")
+        if isinstance(mid_model, list):
+            mid_model = mid_model[0] if mid_model else None
+        conf_f = float(confidence) if confidence is not None else None
+        free_hi_band = (pool == "free" and conf_f is not None
+                        and conf_f >= esc_gate and bool(free_model))
+        mid_band = (pool == "free" and conf_f is not None
+                    and gate <= conf_f < esc_gate and bool(mid_model))
+        free_low_band = (conf_f is not None and conf_f < flash_gate
+                         and bool(free_model))
+        eligible = (free_hi_band or free_low_band) and \
+            not _same_model(free_model, model)
+        mid_eligible = mid_band and not _same_model(mid_model, model)
         # True when a tier fired but its rung IS the source model (identity
         # guard above): logged as already_on_target, nothing rewritten.
         on_target = bool(
-            (free_band and not eligible)
+            ((free_hi_band or free_low_band) and _same_model(free_model, model))
+            or (mid_band and not mid_eligible)
             or (flash_band and not flash_eligible)
             or (esc_band and _same_model(premium, model)))
 
         # Store the RESOLVED decision for EVERY classified turn (incl. "none":
         # below-gate / not-eligible / credit-blocked) so retries and follow-ups
         # never re-classify and re-application stays deterministic.
-        decision = "free" if eligible else ("flash" if flash_eligible else
-                    ("paid" if esc_eligible else "none"))
-        target = (free_model if eligible else
-                  (flash_model if flash_eligible else
-                   (premium if esc_eligible else None)))
+        decision = ("paid" if esc_eligible else ("free" if eligible else
+                    ("mid" if mid_eligible else
+                     ("flash" if flash_eligible else "none"))))
+        target = (premium if esc_eligible else
+                  (free_model if eligible else
+                   (mid_model if mid_eligible else
+                    (flash_model if flash_eligible else None))))
         _store_decision(key, provider, decision, target,
                         float(confidence) if confidence is not None else 0.0)
 
@@ -718,13 +757,16 @@ def on_llm_request(**kwargs):
               "provider": provider, "model": model, "pool": pool,
               "confidence": confidence, "gate": gate, "eligible": eligible,
               "mode": mode,
-              "applied": bool((eligible or flash_eligible) and mode == "live"),
-              "tier": decision if decision != "none" else "mid",
-              "skip_reason": None if (eligible or flash_eligible or esc_eligible) else (
+              "applied": bool((eligible or flash_eligible or mid_eligible)
+                              and mode == "live"),
+              "tier": decision if decision != "none" else "stay",
+              "skip_reason": None if (eligible or mid_eligible or flash_eligible
+                                      or esc_eligible) else (
                   "already_on_target" if on_target else (
                       "below_gate" if pool == "free" else "pool_paid")),
               "escalate_eligible": esc_eligible,
               "escalate_applied": bool(esc_eligible and mode == "live"),
+              "mid_model": mid_model if mid_eligible else None,
               "flash_model": flash_model if flash_eligible else None,
               "premium_model": premium if esc_eligible else None,
               "credit_ok": credit_ok,
@@ -736,8 +778,20 @@ def on_llm_request(**kwargs):
         if eligible:
             updated = dict(request)
             updated["model"] = free_model
+            if free_low_band:
+                reason_str = ("free tier (conf %.2f < %.2f, routine band)"
+                              % (confidence, flash_gate))
+            else:
+                reason_str = "free tier (conf %.2f >= %.2f)" % (confidence, gate)
             return {"request": updated, "source": "kfchow-llm-value-router",
-                    "reason": "free tier (conf %.2f >= %.2f)" % (confidence, gate)}
+                    "reason": reason_str}
+
+        if mid_eligible:
+            updated = dict(request)
+            updated["model"] = mid_model
+            return {"request": updated, "source": "kfchow-llm-value-router",
+                    "reason": "mid tier (conf %.2f in [%.2f, %.2f))"
+                              % (confidence, gate, esc_gate)}
 
         if flash_eligible:
             updated = dict(request)
@@ -858,6 +912,20 @@ def on_llm_execution(request=None, next_call=None, **context):
                       "turn_id": turn_id, "session_id": session_id,
                       "provider": provider, "model": model, "target": target,
                       "applied": True, "reapply": True, "tier": "free",
+                      "api_call_count": api_call_count})
+            return _dispatch(req)
+
+        if decision == "mid":
+            # MID re-apply: NO credit probe — the mid rung is the stable
+            # workhorse; a mid 404 is covered by host retry/fail-open.
+            if not target:  # defensive: never rewrite to ''
+                return _dispatch(request)
+            if mode == "live":
+                req["model"] = target
+                _log({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                      "turn_id": turn_id, "session_id": session_id,
+                      "provider": provider, "model": model, "target": target,
+                      "applied": True, "reapply": True, "tier": "mid",
                       "api_call_count": api_call_count})
             return _dispatch(req)
 

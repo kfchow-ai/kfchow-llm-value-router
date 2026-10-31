@@ -456,14 +456,16 @@ def test_register_registers_both_middlewares():
 
 _SONNET = "anthropic/claude-sonnet-5.5"
 _FLASH = "z-ai/glm-5.3-flash"
+_MID = "z-ai/glm-5.3"
 _LING = "inclusionai/ling-3.0-flash-sante:free"
 _GPT = "openai/gpt-5.4"
 
 
 def _cfg7(**over):
-    """Production-shaped ladder: free 0.65, flash band [0.35, 0.65), esc 0.80."""
+    """Production-shaped ladder: flash [0.35, 0.65), mid [0.65, 0.80), esc 0.80,
+    free rung above 0.80 and below 0.35 (v1.0.10 Marc banding)."""
     base = _cfg(mode="live", flash_gate=0.35, flash_model=_FLASH,
-                escalate_confidence_gate=0.80)
+                mid_model=_MID, escalate_confidence_gate=0.80)
     base.update(over)
     return base
 
@@ -487,11 +489,12 @@ def _run7(monkeypatch, model, pool, conf, tid, **over):
 
 # ---- sonnet (premium) default: the down-moves that were a v1.0.6 gap -------
 
-def test_sonnet_default_free_065_moves_down_to_ling(monkeypatch):
-    out, row, probes, _ = _run7(monkeypatch, _SONNET, "free", 0.65, "s7-1")
-    assert out is not None and out["request"]["model"] == _LING
-    assert row["tier"] == "free" and row["applied"] is True
-    assert probes == []                                   # downgrade never probes
+def test_sonnet_default_free_079_moves_down_to_mid(monkeypatch):
+    # v1.0.10 Marc banding: [0.65, 0.80) free pool rides the MID rung.
+    out, row, probes, _ = _run7(monkeypatch, _SONNET, "free", 0.79, "s7-1")
+    assert out is not None and out["request"]["model"] == _MID
+    assert row["tier"] == "mid" and row["applied"] is True
+    assert probes == []                                   # down-move never probes
 
 
 def test_sonnet_default_free_064_moves_down_to_flash(monkeypatch):
@@ -533,10 +536,10 @@ def test_premium_identity_is_vendor_prefix_and_case_tolerant(monkeypatch):
 
 # ---- gpt-5.4 (foreign default): full ladder both ways ----------------------
 
-def test_gpt54_default_free_065_to_ling(monkeypatch):
-    out, row, _, _ = _run7(monkeypatch, _GPT, "free", 0.65, "g7-1")
-    assert out is not None and out["request"]["model"] == _LING
-    assert row["tier"] == "free"
+def test_gpt54_default_free_070_to_mid_rung(monkeypatch):
+    out, row, _, _ = _run7(monkeypatch, _GPT, "free", 0.70, "g7-1")
+    assert out is not None and out["request"]["model"] == _MID
+    assert row["tier"] == "mid"
 
 
 def test_gpt54_default_free_064_to_flash(monkeypatch):
@@ -583,10 +586,10 @@ def test_ling_free_default_never_touched(monkeypatch, mode, pool, conf):
 # ---- source_mode narrowing --------------------------------------------------
 
 def test_explicit_list_source_mode_narrows_to_listed_sources(monkeypatch):
-    # Listed source behaves exactly like "any" ...
+    # Listed source behaves exactly like "any" (v1.0.10: 0.65 free-pool = MID) ...
     out, _, _, _ = _run7(monkeypatch, _SONNET, "free", 0.65, "x7-1",
                          source_mode=[_SONNET])
-    assert out is not None and out["request"]["model"] == _LING
+    assert out is not None and out["request"]["model"] == _MID
     # ... an unlisted source (gpt-5.4) is skipped before classification ...
     out, row, probes, classified = _run7(monkeypatch, _GPT, "paid", 0.95, "x7-2",
                                          source_mode=[_SONNET])
@@ -637,7 +640,7 @@ def test_allowlist_mode_restores_v106_semantics(monkeypatch):
 
 def test_unset_null_or_empty_source_mode_means_any(monkeypatch):
     for i, mode in enumerate((None, "", "ANY", " any ")):
-        out, _, _, _ = _run7(monkeypatch, _SONNET, "free", 0.65, "n7-%d" % i,
+        out, _, _, _ = _run7(monkeypatch, _SONNET, "free", 0.90, "n7-%d" % i,
                              source_mode=mode)
         assert out is not None and out["request"]["model"] == _LING, repr(mode)
 
@@ -690,9 +693,9 @@ def test_escalate_disabled_blocks_escalation_but_not_downmoves_in_any(monkeypatc
     out, _, probes, _ = _run7(monkeypatch, _GPT, "paid", 0.95, "e7-1",
                               escalate_enabled=False)
     assert out is None and probes == []
-    out, _, _, _ = _run7(monkeypatch, _GPT, "free", 0.65, "e7-2",
+    out, _, _, _ = _run7(monkeypatch, _GPT, "free", 0.70, "e7-2",
                          escalate_enabled=False)
-    assert out is not None and out["request"]["model"] == _LING
+    assert out is not None and out["request"]["model"] == _MID
 
 
 def test_free_rung_identity_guard_when_rung_has_no_free_hint(monkeypatch):
@@ -745,18 +748,22 @@ _CONFS = [0.30, 0.34, 0.35, 0.64, 0.65, 0.79, 0.80]
 
 
 def _expect_free_pool(source, conf):
-    """(wire model or None, skip_reason) for a FREE-pool verdict."""
-    if conf >= 0.65:
+    """(wire model or None, skip_reason) for a FREE-pool verdict (v1.0.10)."""
+    if conf >= 0.80:
         return _LING, None
+    if conf >= 0.65:
+        return (None, "already_on_target") if source == _MID else (_MID, None)
     if conf >= 0.35:
         return (None, "already_on_target") if source == _FLASH else (_FLASH, None)
-    return None, "below_gate"
+    return _LING, None        # routine band: rides the free rung, any source
 
 
 def _expect_paid_pool(source, conf):
     """(wire model or None, skip_reason) for a PAID-pool verdict (esc gate 0.80)."""
     if conf >= 0.80:
         return (None, "already_on_target") if source == _SONNET else (_SONNET, None)
+    if conf < 0.35:
+        return _LING, None    # v1.0.10: the low band is pool-agnostic
     return None, "pool_paid"
 
 
@@ -797,6 +804,47 @@ def _next7(seen):
         seen.append(dict(request))
         return {"model": request.get("model")}
     return _n
+
+
+def test_routine_band_default_and_paid_pool_both_go_free(monkeypatch):
+    # v1.0.10: conf below the flash gate rides the free rung, ANY pool/source.
+    for i, (pool, src) in enumerate((("free", _SONNET), ("paid", _SONNET),
+                                     ("free", _GPT), ("paid", _FLASH))):
+        out, row, probes, _ = _run7(monkeypatch, src, pool, 0.20,
+                                    "r7-low-%d" % i)
+        assert out is not None and out["request"]["model"] == _LING
+        assert "routine band" in out["reason"]
+        assert row["tier"] == "free" and row["applied"] is True
+        assert probes == []
+
+
+def test_routine_band_stays_when_source_is_free_model(monkeypatch):
+    # _FREE_HINTS top guard: an already-free source is never rewritten.
+    out, row, _, classified = _run7(monkeypatch, _LING, "free", 0.20, "r7-low-s")
+    assert out is None and row["skip_reason"] == "already_free_tier"
+    assert classified == []
+
+
+def test_reapply_sonnet_default_mid_downmove_via_request_and_exec(monkeypatch):
+    classified, recs, probes = [], [], []
+    monkeypatch.setattr(pl, "_load_config", lambda: _cfg7())
+    monkeypatch.setattr(pl, "_classify",
+                        lambda f, c: classified.append(1) or ("free", 0.70))
+    monkeypatch.setattr(pl, "_paid_lane_alive", lambda: probes.append(1) or True)
+    monkeypatch.setattr(pl, "_log", recs.append)
+    _reset_decisions()
+    first = pl.on_llm_request(**_kwargs(model=_SONNET, turn_id="rm-1"))
+    assert first["request"]["model"] == _MID
+    second = pl.on_llm_request(**_kwargs(model=_SONNET, turn_id="rm-1",
+                                         api_call_count=2))
+    assert second is not None and second["request"]["model"] == _MID
+    req, ctx = _exec7(_SONNET, "rm-1")
+    seen = []
+    out = pl.on_llm_execution(request=req, next_call=_next7(seen), **ctx)
+    assert req["model"] == _SONNET and seen[0]["model"] == _MID
+    assert out["model"] == _MID
+    assert len(classified) == 1 and probes == []
+    assert [r["tier"] for r in recs if r.get("reapply")] == ["mid", "mid"]
 
 
 def test_reapply_sonnet_default_flash_downmove_via_request_and_exec(monkeypatch):

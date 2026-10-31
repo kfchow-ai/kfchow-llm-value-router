@@ -1,5 +1,5 @@
 name: kfchow-llm-value-router
-version: "1.0.9"
+version: "1.0.10"
 description: "Per-turn LLM model routing guided by the KFChow value leaderboard. On the first provider call of a turn, a vendor classifier picks a tier on a 4-rung ladder (free / flash / mid / premium) and in live mode rewrites the request model to that tier's rung. Source-agnostic: works from any default model (premium, mid, flash or foreign), moving both up and down its own provider's rungs. Per-request kill switch (v1.0.8): a client can disable routing for its own request with the X-KFC-Router header (or a router body field) — no rewrite, no classifier call, no credit probe, one log row. Fail-open, shadow-by-default."
 author: KFChow
 license: MIT
