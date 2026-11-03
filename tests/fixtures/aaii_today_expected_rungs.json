@@ -1,0 +1,136 @@
+{
+  "ladder_mode": "aaii_bands",
+  "provider": "nous",
+  "resolved_at": "2026-11-03T13:00:00+00:00",
+  "source": "https://kfchow.com/llm-value-leaderboard/data/models.json",
+  "tiers": {
+    "premium": {
+      "model": "openai/gpt-6.1-terra",
+      "price_avg": 1.9892,
+      "aaii": 51.0,
+      "price_reference_model": "openai/gpt-6.1-terra",
+      "status": "active",
+      "collapsed_into": null,
+      "reason": "lowest probed Avg plus 10% tolerance, highest AAII",
+      "fold_streak": 0,
+      "fold_signal": null,
+      "rewrite_allowed": true,
+      "candidate": {
+        "model": "openai/gpt-6.1-terra",
+        "price_avg": 1.9892,
+        "aaii": 51.0,
+        "board_id": "openai/gpt-6.1-terra"
+      }
+    },
+    "mid": {
+      "model": "openai/gpt-6.1-terra",
+      "price_avg": 1.9892,
+      "aaii": 51.0,
+      "price_reference_model": "openai/gpt-6.1-terra",
+      "status": "collapsed",
+      "collapsed_into": "premium",
+      "reason": "collapsed after two consecutive Avg-price dominance failures",
+      "fold_streak": 2,
+      "fold_signal": "fail",
+      "rewrite_allowed": false,
+      "candidate": {
+        "model": "google/gemini-4-argon",
+        "price_avg": 3.6509,
+        "aaii": 50.0,
+        "board_id": "google/gemini-4-argon"
+      }
+    },
+    "flash": {
+      "model": "minimax/minimax-m3.1-flash",
+      "price_avg": 0.1777,
+      "aaii": 29.0,
+      "price_reference_model": "minimax/minimax-m3.1-flash",
+      "status": "active",
+      "collapsed_into": null,
+      "reason": "lowest probed Avg plus 10% tolerance, highest AAII",
+      "fold_streak": 2,
+      "fold_signal": "pass",
+      "rewrite_allowed": true,
+      "candidate": {
+        "model": "minimax/minimax-m3.1-flash",
+        "price_avg": 0.1777,
+        "aaii": 29.0,
+        "board_id": "minimax/minimax-m3.1-flash"
+      }
+    },
+    "free": {
+      "model": "reflection/beam-1.0-501b-a23b:free",
+      "price_avg": null,
+      "aaii": 18.0,
+      "price_reference_model": null,
+      "status": "active",
+      "collapsed_into": null,
+      "reason": "retained existing :free pin; replacement or upper Avg unavailable",
+      "fold_streak": 0,
+      "fold_signal": null,
+      "rewrite_allowed": true,
+      "candidate": null
+    }
+  },
+  "alerts": [
+    {
+      "tier": "free",
+      "code": "no_qualified_candidate",
+      "message": "kept the current pin; no board/catalog/probe candidate qualified"
+    },
+    {
+      "tier": "free",
+      "code": "free_aaii_unknown_or_below_floor",
+      "message": "current free pin retained; its AAII is unknown or below 25"
+    }
+  ],
+  "shadow": {
+    "ratio_checks": {
+      "mid": {
+        "threshold": 0.5,
+        "candidate_price_avg": 3.6509,
+        "above_price_avg": 1.9892,
+        "would_collapse": true
+      },
+      "flash": {
+        "threshold": 0.25,
+        "candidate_price_avg": 0.1777,
+        "above_price_avg": 1.9892,
+        "would_collapse": false
+      }
+    },
+    "price_moves": []
+  },
+  "price_history": {
+    "openai/gpt-6.1-terra": [
+      {
+        "at": "2026-11-03T13:00:00+00:00",
+        "price_avg": 1.9892
+      }
+    ],
+    "google/gemini-4-argon": [
+      {
+        "at": "2026-11-03T13:00:00+00:00",
+        "price_avg": 3.6509
+      }
+    ],
+    "minimax/minimax-m3.1-flash": [
+      {
+        "at": "2026-11-03T13:00:00+00:00",
+        "price_avg": 0.1777
+      }
+    ],
+    "reflection/beam-1.0-501b-a23b": [
+      {
+        "at": "2026-11-03T13:00:00+00:00",
+        "price_avg": 0.3808
+      }
+    ],
+    "fixture/unknown-free:free": [
+      {
+        "at": "2026-11-03T13:00:00+00:00",
+        "price_avg": 0.0
+      }
+    ]
+  }
+}

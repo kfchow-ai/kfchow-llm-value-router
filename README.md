@@ -19,68 +19,58 @@ Developer: KFChow <hotline@kfchow.com> · License: MIT
 ## What it does
 
 On the **first provider call of each turn** the plugin classifies the turn
-once; the stored decision (including "no rewrite") is re-applied on every
-later call of the same turn — tool-loop follow-ups and in-attempt retries
-keep the routed model instead of silently reverting. The plugin:
+once. Later calls reuse the decision, but first re-check the current provider
+and source eligibility; removing a lane or allowlisted source takes effect on
+the next call, without re-classifying. The plugin:
 
-1. checks eligibility — only providers you list in the config are ever
-   touched (whatever default model you run, see *Source-agnostic ladder*
-   below), a turn already on a free-tier model is never re-routed, and a turn
-   is never "moved" onto the model it is already on;
-2. asks a vendor classifier (TypeSafe "Jev", a 3–10s bounded call) which pool
-   the turn belongs to (routine vs strong) and how confident it is;
-3. in `shadow` mode (default): records the decision and leaves the request
-   untouched; in `live` mode: rewrites the request's model to the tier's rung;
-4. conversely, when a turn starts on a **mid** rung and the classifier says it
-   needs a strong model, the ESCALATION path can rewrite to the provider's
-   premium rung — guarded by a credit probe that **fails closed** so an
-   exhausted metered account never receives a doomed rewrite.
+1. checks eligibility separately for downgrades (`route_providers`) and
+   escalation (`escalate_providers`); an already-free source and a no-op
+   rewrite are skipped;
+2. asks the TypeSafe "Jev" classifier which pool the turn belongs to and its
+   confidence (bounded timeout);
+3. in `shadow` mode records the decision without rewriting; in `live` mode
+   rewrites the request model to the eligible same-provider rung;
+4. credit-probes a paid escalation on a metered lane and fails closed if the
+   account cannot be verified.
 
-### The 4-tier ladder (v1.0.6)
+### The four-tier ladder (v1.0.10 banding + D7)
 
-One classify per turn → pool + confidence → exactly one tier:
+The following uses the **example** gates `flash_gate=0.35`,
+`confidence_gate=0.65`, and `escalate_confidence_gate=0.80`. The last gate
+also sets the free-pool mid/free boundary.
 
-| tier | condition | target rung |
-|------|-----------|-------------|
-| premium | pool=paid AND conf ≥ `escalate_confidence_gate` (default **0.80**) | provider's premium rung (credit-probed, fail-closed) |
-| free | pool=free AND conf ≥ `confidence_gate` | provider's free rung |
-| **flash** | pool=free AND `flash_gate` ≤ conf < `confidence_gate` (default band 0.35–0.65) | provider's **flash** rung — near-routine turns off the mid rung at a fraction of its price |
-| mid (stay) | everything else | unchanged — pool=paid below the escalation gate NEVER downgrades |
+| Classifier verdict | Confidence | Target |
+|---|---:|---|
+| paid pool | ≥ 0.80 | premium (if escalation-eligible; metered lanes credit-probed) |
+| paid pool | < 0.80 | source model, by default |
+| free pool | ≥ 0.80 | free |
+| free pool | 0.65–<0.80 | mid |
+| free pool | 0.35–<0.65 | flash |
+| free pool | < 0.35 | free (routine band) |
 
-`flash_gate` defaults to 0.35; the flash rung resolves per provider
-(`rungs.<provider>.flash`, falling back to the flat `flash_model` key) exactly
-like the free rung. With no flash rung configured the band simply stays mid —
-fail-open. Flash never touches the credit probe: it is the stable workhorse
-tier, and host retry/fail-open covers a flash 404. Escalation defaults to the
-0.80 gate (an explicit `escalate_confidence_gate` override still wins), so the
-0.65–0.79 band no longer false-escalates.
+**D7 default:** absent or `false`, `paid_pool_routine_band` leaves paid-pool
+verdicts below `flash_gate` on their source model. Set
+`"paid_pool_routine_band": true` in `lane2_config.json` to restore the
+v1.0.10 pool-agnostic routine band (paid and free verdicts below 0.35 ride
+free). All downgrade bands require routing-lane eligibility. A missing rung
+leaves the request on its source. Flash, mid and free never perform the credit
+probe. `confidence_gate` falls back to 0.80 in code if no JSON or panel value
+is present; the example and manifest panel default are 0.65.
 
-Model rungs come from the KFChow value leaderboard (https://kfchow.com/llm)
-via the bundled resolver script — never hardcoded — because rankings update
-twice daily and free-tier model ids expire silently.
+### Source and provider eligibility
 
-### Source-agnostic ladder (v1.0.7)
+`source_mode` narrows the source model on **each** provider lane:
 
-The ladder moves **both ways from whatever default model you run**: a premium-,
-mid-, flash- or foreign-default install gets the same tiers on its own
-provider's rungs, so a flash-default install is never left with a dead premium
-rung. Eligibility is **provider match only**; `source_mode` narrows it:
-
-| `source_mode` | eligible source models |
+| `source_mode` | Eligible source models |
 |---|---|
-| `"any"` (default; also unset / null / empty) | every model on a listed provider (`route_providers` / `escalate_providers`); `route_models` / `escalate_models` are ignored |
-| `"allowlist"` | exact v1.0.6 behaviour: the source must be listed in `route_models` (free lane) or `escalate_models` (escalation lane) |
-| `["model-a", "model-b"]` | only those exact source models, on both lanes; `route_models` / `escalate_models` are ignored |
+| `"any"` (default; also unset / null / empty) | any source on the corresponding listed provider; model lists are ignored |
+| `"allowlist"` | downgrades require `route_providers` **and** `route_models`; escalation requires `escalate_providers` **and** `escalate_models` |
+| `["model-a", "model-b"]` | only those exact sources, on the corresponding listed providers |
 
-An unrecognised value falls back to `"allowlist"` (the conservative side: it
-touches fewer turns, never more) and logs one warning per distinct value.
-
-Guards that hold in every mode: a source already on a free model (`:free`,
-`free`, `space-bunny`) is never rewritten (logged `already_free_tier`); a
-paid-pool verdict below the escalation gate never downgrades; and a turn is
-never moved onto the model it is already on — a premium-default turn with a
-strong-model verdict stays put (logged `already_on_target`, no credit probe
-spent), as does a flash-default turn inside the flash band.
+A provider listed only in `escalate_providers` can escalate but cannot use a
+downgrade band. An unrecognised `source_mode` falls back to `"allowlist"`
+with a warning. A source already on a free model (`:free`, `free`,
+`space-bunny`) and a target identical to the source are never rewritten.
 
 ## Per-request kill switch (`X-KFC-Router`, v1.0.8)
 
@@ -111,9 +101,11 @@ re-application of an earlier decision — the rewrite cannot reappear mid-turn.
 
 - **Fail-open**: any error/timeout/malformed answer returns `None`; the
   original request is untouched. The plugin can fail to route; it never fails
-  a turn. With no flash rung configured the flash band stays mid — an absent
-  tier can never break a turn.
-- **Shadow by default**; live requires a deliberate config edit by a human.
+  a turn. With no flash rung configured the flash band stays on the source
+  model — an absent tier can never break a turn.
+- **Shadow by default**. Since v1.0.9 the Desktop plugin-settings panel's
+  saved `enabled`, `mode` and `confidence_gate` values override the JSON on
+  every call; the panel can switch to live without a JSON edit or restart.
 - **Credit probe fails closed**: escalation to a paid premium rung only fires
   when the metered lane answers a live probe; unknown state = no escalation.
   The flash tier never probes and never needs a key.
@@ -168,8 +160,11 @@ python3 scripts/llm-rank-resolver.py        # writes ~/.hermes/jev/llm_rungs.jso
 python3 scripts/llm-rank-resolver.py --dry-run   # print only
 ```
 
-Then fill the resolved ids into the `rungs` section per provider. Stays in
-`shadow` until you set `"mode": "live"`.
+In legacy mode the resolver reports leaderboard names; map them to IDs in
+`rungs.<provider>` yourself. The middleware does **not** consume the legacy
+resolver output automatically. Shadow is the default, but a previously saved
+Desktop panel value for `enabled`, `mode` or `confidence_gate` wins over the
+JSON; check the panel before assuming routing is still shadowed.
 
 ## Install (skill — the method, without the plugin)
 
@@ -185,13 +180,74 @@ hermes skills install kfchow-ai/kfchow-llm-value-router/skills/llm-value-leaderb
 hermes skills install kfchow-ai/kfchow-llm-value-router/skills/llm-value-leaderboard-rungs
 ```
 
-## The KFChow value rule
+## The KFChow value rule (legacy default)
 
 premium = the highest AAII score among the **top-5 by value** on
 https://kfchow.com/llm; mid = the same rule under a **$1.00/Mtok** price
-ceiling, so the rungs are separated by price band rather than hand-picking.
-The resolver re-derives them from the live feed every run and exits 1 —
-keeping the last good file — whenever the feed cannot be parsed.
+ceiling. The legacy resolver reads the RSS feed and keeps the last good file
+on a failed parse. This rule and its output are unchanged unless the new mode
+is explicitly selected.
+
+## Opt-in AAII-band resolver (Nous only)
+
+To use the new resolver, put `"ladder_mode": "aaii_bands"` in
+`lane2_config.json` and fill **all four existing** `rungs.nous` pins first.
+Those are the retention baseline if the board has no qualifying candidate;
+the resolver will not create an incomplete ladder. Optionally set
+`rungs_path` to the intended output path; otherwise it defaults to
+`$HERMES_HOME/jev/llm_rungs.json` (or `~/.hermes/jev/llm_rungs.json`).
+Keep `route_providers` and `escalate_providers` explicitly scoped to the
+providers you intend to use. The AAII document itself is Nous-only.
+
+```bash
+# Requires NOUS_API_KEY for the Nous catalog and exact-model probes.
+python3 scripts/llm-rank-resolver.py --dry-run  # probes candidates; no write
+python3 scripts/llm-rank-resolver.py            # atomically writes rungs_path
+```
+
+`--config PATH` selects a different lane2 JSON; `--ladder-mode aaii_bands`
+overrides the resolver mode for that invocation, but **does not edit the
+middleware config**. `--board-url`, `--nous-base-url`, and `--out` override
+individual endpoints/output. `KFCHOW_BOARD_URL`, `NOUS_BASE_URL`, and
+`KFCHOW_RUNGS_OUT` are the corresponding environment overrides. If `--out` or
+`KFCHOW_RUNGS_OUT` differs from `rungs_path`, point the middleware at the same
+file explicitly. The Desktop panel does not wire `ladder_mode` or
+`paid_pool_routine_band`; set these in the JSON.
+
+The resolver reads the full `models.json` board, including **unranked** rows,
+and uses only `intelligence_score` (AAII) and `pricing.blended` (Avg); it never
+uses `blended_lowest` as a price substitute. Rows without Avg or with missing
+or sub-25 AAII are excluded. Bands are premium AAII > 50, mid 40–50, flash 25–<40, and free
+zero-price or `:free` IDs with AAII ≥ 25. An ID, or its `:free` variant, must
+be in the Nous `/v1/models` catalog and pass a one-token probe. Among the
+probe-green candidates, find the lowest Avg and choose the highest AAII among
+those within 10% of that price; ties break by lower Avg then model ID. Probes
+may incur charges, **including in dry-run**.
+
+Each tier contains `model`, `price_avg`, `aaii`, `status`, `collapsed_into`,
+`reason`, and persisted `fold_streak`; the document also records
+`rewrite_allowed`, candidate details, alerts, shadow checks, and up to seven
+days of board-price history. `price_reference_model` identifies the board row
+used for Avg if the catalog supplies only its `:free` variant. That Avg is a
+board reference, not a claim about the variant's actual charge. If a retained
+`:free` pin has no matching board price, its `price_avg` stays null; it is
+retained and an unknown/below-floor AAII is flagged.
+
+A lower tier whose candidate Avg exceeds the stronger active tier's Avg fails
+the operative **1.0×** dominance rule. Two consecutive failures collapse it
+into the tier above; two consecutive passes reactivate it. While the first
+failure is pending, an unsafe retained pin is not a rewrite target. A collapsed
+mid remains a dormant slot: its confidence band uses the next cheaper active
+slot (flash/free) or stays on source, **never premium**. A refresh that
+changes a cached target stops replaying the old target until the next turn.
+The stricter mid 0.5× and flash 0.25× ratios and price moves (>50% against the
+seven-day median, or >2× within a day) are **shadow alerts only**; they never
+trigger folding. A candidate-less tier retains its prior pin and raises an
+alert. A board fetch, schema or catalog error exits non-zero without replacing
+the last good file. If no valid AAII file exists, middleware leaves requests
+unchanged rather than guessing. The [full synthetic rung document](tests/fixtures/aaii_today_expected_rungs.json)
+shows the today-board fixture's two-refresh collapse; it is not a live
+availability claim.
 
 ## FAQ — the traps we hit so you don't have to
 
@@ -227,7 +283,8 @@ endpoint. Rungs are resolved per provider and rewrites stay same-provider.
 ├── plugin.yaml                # manifest (provides_middleware: [llm_request, llm_execution])
 ├── __init__.py                # the middleware (request: classify+rewrite; execution: re-apply)
 ├── scripts/jev_client.py      # vendored vendor client (env-first key)
-├── scripts/llm-rank-resolver.py  # feed -> rungs resolver
+├── scripts/llm-rank-resolver.py  # legacy RSS / opt-in AAII resolver entrypoint
+├── scripts/aaii_bands.py       # catalog, probes, fold state and shadow checks
 ├── skills/llm-value-leaderboard-rungs/   # the method as a standalone skill
 ├── examples/lane2_config.example.json   # config template (shadow)
 ├── docs/SAFETY.md             # fail-open / fail-closed / disclosure contract
@@ -240,9 +297,10 @@ endpoint. Rungs are resolved per provider and rewrites stay same-provider.
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest -q
 ```
 
-All tests are offline: the vendor call is exercised through a transport test
-seam, the feed through fixture XML. Nothing in the suite touches a network or
-a key.
+All tests are offline: classifier, catalog, probes and board use synthetic
+fixtures/test doubles; real credentials are unset, per-test caches and state
+are isolated, and DNS/socket operations are blocked. The suite does not touch
+a real network or key.
 
 ## License
 

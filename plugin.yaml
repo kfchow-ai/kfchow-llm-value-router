@@ -1,6 +1,6 @@
 name: kfchow-llm-value-router
 version: "1.0.10"
-description: "Per-turn LLM model routing guided by the KFChow value leaderboard. On the first provider call of a turn, a vendor classifier picks a tier on a 4-rung ladder (free / flash / mid / premium) and in live mode rewrites the request model to that tier's rung. Source-agnostic: works from any default model (premium, mid, flash or foreign), moving both up and down its own provider's rungs. Per-request kill switch (v1.0.8): a client can disable routing for its own request with the X-KFC-Router header (or a router body field) — no rewrite, no classifier call, no credit probe, one log row. Fail-open, shadow-by-default."
+description: "Per-turn LLM model routing guided by the KFChow value leaderboard. In live mode the classifier can route free-pool turns to free, flash or mid, and credit-guarded paid-pool turns to premium. Paid turns below flash_gate stay on their source by default; paid_pool_routine_band restores v1.0.10 pool-agnostic routing. Downgrades require the routing lane's provider and source eligibility. Optional ladder_mode aaii_bands uses a probed Nous-only ladder; legacy remains the resolver default. Per-request kill switch, fail-open and shadow-by-default."
 author: KFChow
 license: MIT
 requires_hermes: ">=0.21.5"
@@ -22,52 +22,63 @@ config_schema:
   confidence_gate:
     type: float
     default: 0.65
-    description: "Minimum classifier confidence to rewrite the model (free tier). PANEL-WIRED (v1.0.9): the value saved in plugin settings wins over lane2_config.json every turn."
+    description: "Boundary between free-pool flash and mid bands; the example/panel value is 0.65 and the code fallback without a saved value is 0.80. PANEL-WIRED: saved plugin settings win over lane2_config.json."
+  ladder_mode:
+    type: str
+    default: legacy
+    description: "Resolver mode in lane2_config.json: legacy (default) keeps the RSS top-N rule; aaii_bands opts into the board Avg/AAII resolver and makes middleware read rungs_path. This setting is not panel-wired."
   feed_url:
     type: str
     default: "https://kfchow.com/llm-value-leaderboard/feed.xml"
-    description: "Informational only (no runtime consumer): documents the leaderboard feed the ladder is derived from. The rungs-refresh script owns its own feed path; editing here does not retarget it."
+    description: "Informational only (no runtime consumer): documents the legacy leaderboard feed. The resolver owns its --feed-url; editing here does not retarget it."
   rungs_path:
     type: str
     default: "~/.hermes/jev/llm_rungs.json"
-    description: "Informational only (no runtime consumer): documents where llm-rank-resolver.py writes feed-derived rungs. The scripts own their paths; editing here does not retarget them."
+    description: "Informational in legacy mode. In aaii_bands mode the resolver writes, and both middlewares read, this Nous-only rung document; a missing or invalid document leaves requests unchanged."
   route_providers:
     type: list
-    description: "Providers eligible for the free-tier downgrade path."
+    description: "Providers eligible for all free, flash and mid downgrade bands; source_mode and route_models may narrow eligibility further."
   source_mode:
     type: str
     default: any
-    description: "Which SOURCE models are eligible (v1.0.7). any = provider match only, so any default model moves both ways on its own provider's rungs (route_models/escalate_models ignored); allowlist = exact v1.0.6 behaviour (source must be in route_models or escalate_models); a JSON list of model ids in lane2_config.json = only those exact sources. Unrecognised values fall back to allowlist with one warning."
+    description: "Source models eligible on each lane. any = provider match only; allowlist = route_models gates downgrade bands and escalate_models gates escalation; a JSON list = only those exact sources on each configured provider lane. Unrecognised values fall back to allowlist with one warning."
   route_models:
     type: list
-    description: "Model ids eligible for the free-tier downgrade path (consulted only when source_mode is allowlist)."
+    description: "Source model IDs eligible for free, flash and mid downgrades when source_mode is allowlist."
   free_model:
     type: str
-    description: "Flat free-tier fallback rung (per-provider rungs take precedence)."
+    description: "Flat free-tier fallback rung (per-provider rungs take precedence in legacy mode)."
   flash_gate:
     type: float
     default: 0.35
-    description: "Lower bound of the FLASH band: free-pool turns with flash_gate <= confidence < confidence_gate route to the flash rung instead of staying mid."
+    description: "Free-pool confidence below this boundary routes to free; from flash_gate up to confidence_gate it routes to flash. Paid low-confidence turns stay on source unless paid_pool_routine_band is true."
+  paid_pool_routine_band:
+    type: bool
+    default: false
+    description: "D7: false or absent keeps paid-pool verdicts below flash_gate on the source model. true restores v1.0.10 pool-agnostic routing to free in that band. Set in lane2_config.json; not panel-wired."
   flash_model:
     type: str
-    description: "Flat flash-tier fallback rung (per-provider rungs take precedence)."
+    description: "Flat flash-tier fallback rung (per-provider rungs take precedence in legacy mode)."
+  mid_model:
+    type: str
+    description: "Flat mid-tier fallback rung for free-pool confidence between confidence_gate and escalate_confidence_gate; per-provider rungs take precedence in legacy mode."
   escalate_enabled:
     type: bool
     default: true
-    description: "Enable the mid -> premium escalation path."
+    description: "Enable the premium escalation path."
   escalate_providers:
     type: list
-    description: "Providers eligible for escalation (must match the turn's originating provider)."
+    description: "Providers eligible for escalation (must match the turn's originating provider). A provider may escalate without being eligible for downgrades."
   escalate_models:
     type: list
-    description: "Mid-rung model ids eligible for escalation (consulted only when source_mode is allowlist)."
+    description: "Source model IDs eligible for escalation when source_mode is allowlist."
   premium_model:
     type: str
-    description: "Flat premium fallback rung (per-provider rungs take precedence)."
+    description: "Flat premium fallback rung (per-provider rungs take precedence in legacy mode)."
   escalate_confidence_gate:
     type: float
     default: 0.80
-    description: "Escalation gate (premium tier); falls back to the code default 0.80 when unset."
+    description: "Paid-pool premium escalation threshold AND the free-pool mid/free boundary; defaults to 0.80 when unset."
   credit_probe:
     type: bool
     default: true

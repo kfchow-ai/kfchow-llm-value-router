@@ -90,6 +90,7 @@ def test_escalation_fails_closed_when_probe_raises(monkeypatch):
     monkeypatch.setattr(pl, "_classify", lambda feats, cfg: ("paid", 0.99))
     monkeypatch.setattr(pl, "_log", lambda rec: None)
     # Make the probe blow up: unknown credit state must NOT escalate.
+    monkeypatch.setenv("NOUS_API_KEY", "synthetic-test-key")
     monkeypatch.setattr(pl, "urllib", type("U", (), {"request": None})())
     pl._CREDIT["ok"] = None
     pl._CREDIT["checked_at"] = 0.0
@@ -155,6 +156,7 @@ def test_escalation_respects_its_own_gate(monkeypatch):
 
 def test_credit_probe_is_cached(monkeypatch):
     calls = {"n": 0}
+    monkeypatch.setenv("NOUS_API_KEY", "synthetic-test-key")
 
     def fake_open(*a, **k):
         calls["n"] += 1
@@ -168,7 +170,7 @@ def test_credit_probe_is_cached(monkeypatch):
     pl._paid_lane_alive()
     first = calls["n"]
     pl._paid_lane_alive()          # within TTL -> cached
-    assert calls["n"] == first
+    assert first == 1 and calls["n"] == first
 
 
 def test_per_provider_rungs_never_cross_providers(monkeypatch):
@@ -340,6 +342,7 @@ def test_below_gate_never_rewrites(monkeypatch):
 def test_paid_pool_never_rewrites(monkeypatch):
     monkeypatch.setattr(pl, "_load_config", lambda: _cfg(mode="live"))
     monkeypatch.setattr(pl, "_classify", lambda feats, cfg: ("paid", 0.99))
+    monkeypatch.setattr(pl, "_paid_lane_alive", lambda: False)
     monkeypatch.setattr(pl, "_log", lambda rec: None)
     _reset_decisions()
     assert pl.on_llm_request(**_kwargs()) is None
@@ -629,13 +632,15 @@ def test_allowlist_mode_restores_v106_semantics(monkeypatch):
     out, _, _, _ = _run7(monkeypatch, _FLASH, "free", 0.99, "a7-2",
                          source_mode="allowlist")
     assert out is not None and out["request"]["model"] == _LING
-    # listed mid default (escalate_models): escalates, and flash band applies
+    # listed mid default (escalate_models): escalation works, but it is NOT in
+    # route_models, so even an otherwise eligible free verdict cannot downgrade.
     out, _, _, _ = _run7(monkeypatch, "z-ai/glm-5.3", "paid", 0.90, "a7-3",
                          source_mode="allowlist")
     assert out is not None and out["request"]["model"] == _SONNET
-    out, _, _, _ = _run7(monkeypatch, "z-ai/glm-5.3", "free", 0.50, "a7-4",
-                         source_mode="allowlist")
-    assert out is not None and out["request"]["model"] == _FLASH
+    out, row, probes, classified = _run7(monkeypatch, "z-ai/glm-5.3", "free", 0.50, "a7-4",
+                                         source_mode="allowlist")
+    assert out is None and row["skip_reason"] == "below_gate"
+    assert classified == [1] and probes == []
 
 
 def test_unset_null_or_empty_source_mode_means_any(monkeypatch):
@@ -762,9 +767,7 @@ def _expect_paid_pool(source, conf):
     """(wire model or None, skip_reason) for a PAID-pool verdict (esc gate 0.80)."""
     if conf >= 0.80:
         return (None, "already_on_target") if source == _SONNET else (_SONNET, None)
-    if conf < 0.35:
-        return _LING, None    # v1.0.10: the low band is pool-agnostic
-    return None, "pool_paid"
+    return None, "pool_paid"  # D7: even the low-confidence paid pool stays
 
 
 @pytest.mark.parametrize("conf", _CONFS)
@@ -806,12 +809,23 @@ def _next7(seen):
     return _n
 
 
-def test_routine_band_default_and_paid_pool_both_go_free(monkeypatch):
-    # v1.0.10: conf below the flash gate rides the free rung, ANY pool/source.
+def test_routine_band_default_restricts_paid_pool(monkeypatch):
+    for i, src in enumerate((_SONNET, _GPT, _FLASH)):
+        out, row, probes, _ = _run7(monkeypatch, src, "free", 0.20, "r7-free-%d" % i)
+        assert out is not None and out["request"]["model"] == _LING
+        assert "routine band" in out["reason"] and row["tier"] == "free"
+        assert probes == []
+        out, row, probes, _ = _run7(monkeypatch, src, "paid", 0.20, "r7-paid-%d" % i)
+        assert out is None and row["skip_reason"] == "pool_paid"
+        assert row["tier"] == "stay" and probes == []
+
+
+def test_routine_band_opt_in_restores_pool_agnostic_v1010(monkeypatch):
     for i, (pool, src) in enumerate((("free", _SONNET), ("paid", _SONNET),
                                      ("free", _GPT), ("paid", _FLASH))):
         out, row, probes, _ = _run7(monkeypatch, src, pool, 0.20,
-                                    "r7-low-%d" % i)
+                                    "r7-legacy-%d" % i,
+                                    paid_pool_routine_band=True)
         assert out is not None and out["request"]["model"] == _LING
         assert "routine band" in out["reason"]
         assert row["tier"] == "free" and row["applied"] is True
