@@ -2,6 +2,7 @@
   "enabled": true,
   "mode": "shadow",
   "confidence_gate": 0.65,
+  "ladder_mode": "legacy",
   "feed_url": "https://kfchow.com/llm-value-leaderboard/feed.xml",
   "rungs_path": "~/.hermes/jev/llm_rungs.json",
   "route_providers": [
@@ -14,7 +15,9 @@
   ],
   "free_model": "",
   "flash_gate": 0.35,
+  "paid_pool_routine_band": false,
   "flash_model": "",
+  "mid_model": "",
   "escalate_enabled": true,
   "escalate_providers": [
     "nous"
@@ -35,10 +38,10 @@
     "nous": {
       "free": "",
       "flash": "",
-      "mid": [],
+      "mid": "",
       "premium": "",
-      "note": "fill from scripts/llm-rank-resolver.py output (the KFChow value rule); a rewrite never crosses providers"
+      "note": "Fill all four existing Nous pins before opting into ladder_mode aaii_bands; a rewrite never crosses providers."
     }
   },
-  "_comment": "Example configuration. mode stays shadow until you deliberately flip it to live. 4-tier ladder (v1.0.6): premium = paid AND conf >= escalate_confidence_gate (0.80); free = free AND conf >= confidence_gate; flash = free AND flash_gate <= conf < confidence_gate; mid (stay) = everything else. Source-agnostic (v1.0.7): source_mode \"any\" (default) makes eligibility provider-match only, so any default model moves both ways on its own provider's rungs; route_models/escalate_models are consulted only when source_mode is \"allowlist\" (exact v1.0.6 behaviour); a JSON list of model ids pins explicit sources. PER-REQUEST KILL SWITCH (v1.0.8): no config key here \u2014 the client sends the header 'X-KFC-Router: off' (or \"metadata\": {\"router\": \"off\"} / \"router\": \"off\" in the JSON body) on any request it wants routed normally; disabling values off/0/false/disable/disabled (case-insensitive, unknown values ignored), the flag only ever turns routing OFF, and a flagged request gets no rewrite, no vendor call, no credit probe and one log row with skip_reason 'disabled_by_request'. Model ids here are ILLUSTRATIVE placeholders from the public leaderboard; resolve fresh rungs with scripts/llm-rank-resolver.py (free ids rotate and expire silently). Keys are read from the environment only: NOUS_API_KEY for the credit probe, JEVI_API_KEY for the vendor classifier."
+  "_comment": "Example configuration. Shadow is the shipped default; since v1.0.9 the Desktop panel values for enabled, mode and confidence_gate override this file when saved. With the example gates, free-pool confidence below 0.35 goes free, 0.35-0.65 flash, 0.65-0.80 mid and at least 0.80 free. Paid-pool confidence below 0.80 stays on source; paid_pool_routine_band true restores the v1.0.10 pool-agnostic below-0.35 free band. All downgrades require route_providers and source eligibility; escalation uses escalate_providers and its own source eligibility. source_mode any means provider match, allowlist uses route_models/escalate_models, and a list pins exact sources. ladder_mode legacy is the default; aaii_bands is opt-in and requires four existing Nous pins plus a resolver refresh. X-KFC-Router: off or router: off disables routing for that request. Model IDs are illustrative; free IDs expire. NOUS_API_KEY is read from the environment; the Jev client uses JEVI_API_KEY or its own optional creds file."
 }

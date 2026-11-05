@@ -19,7 +19,9 @@ Output: ~/.hermes/jev/llm_rungs.json (override with --out / KFCHOW_RUNGS_OUT)
 Run:    python3 llm-rank-resolver.py            # resolve + write
         python3 llm-rank-resolver.py --dry-run  # print, do not write
 Exit 0 on success, 1 if the feed can't be parsed (the caller keeps the last
-good file — it must never be overwritten with a partial parse).
+good file — it must never be overwritten with a partial parse). The optional
+ladder_mode=aaii_bands reads the full JSON board, checks the Nous catalog and
+one 16-token-maximum completion probe per candidate, and persists four tiers with fold state; see aaii_bands.py.
 """
 import argparse
 import json
@@ -28,6 +30,9 @@ import re
 import sys
 import time
 import urllib.request
+
+from aaii_bands import (BOARD_URL, NOUS_BASE_URL, fetch_board, fetch_catalog,
+                        probe_model, resolve_aaii, run_aaii)
 
 DEFAULT_FEED = "https://kfchow.com/llm-value-leaderboard/feed.xml"
 FEED = os.environ.get("KFCHOW_FEED_URL", DEFAULT_FEED)
@@ -97,15 +102,60 @@ def resolve(rows, top_n=DEFAULT_TOP_N, mid_ceiling=MID_PRICE_CEILING):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
-        description="Resolve mid/premium model rungs from the KFChow value leaderboard feed.")
+        description="Resolve leaderboard model rungs (legacy RSS or opt-in AAII bands).")
     ap.add_argument("--dry-run", action="store_true", help="print the result, do not write")
     ap.add_argument("--feed-url", default=FEED,
                     help="leaderboard RSS/Atom feed URL (default: %s; env KFCHOW_FEED_URL)" % DEFAULT_FEED)
     ap.add_argument("--top-n", type=int, default=DEFAULT_TOP_N,
                     help="how many top-by-value rows to consider (default: %d)" % DEFAULT_TOP_N)
-    ap.add_argument("--out", default=os.environ.get("KFCHOW_RUNGS_OUT", default_out()),
+    ap.add_argument("--out", default=None,
                     help="output JSON path (default: ~/.hermes/jev/llm_rungs.json; env KFCHOW_RUNGS_OUT)")
+    ap.add_argument("--ladder-mode", choices=("legacy", "aaii_bands"), default=None,
+                    help="override ladder_mode in the config; unset defaults to legacy")
+    ap.add_argument("--config", default=os.path.join(os.path.dirname(default_out()), "lane2_config.json"),
+                    help="lane2 config containing ladder_mode and current Nous pins")
+    ap.add_argument("--board-url", default=os.environ.get("KFCHOW_BOARD_URL", BOARD_URL),
+                    help="AAII mode: leaderboard models.json URL")
+    ap.add_argument("--nous-base-url", default=os.environ.get("NOUS_BASE_URL", NOUS_BASE_URL),
+                    help="AAII mode: Nous OpenAI-compatible v1 base URL")
     args = ap.parse_args(argv)
+
+    config, config_error = {}, None
+    if args.ladder_mode != "legacy":
+        try:
+            with open(os.path.expanduser(args.config), encoding="utf-8") as fh:
+                config = json.load(fh)
+            if not isinstance(config, dict):
+                raise ValueError("config must be a JSON object")
+        except FileNotFoundError:
+            config = {}
+        except (OSError, ValueError) as exc:
+            config, config_error = {}, exc
+    # Legacy historically ignored lane2_config.json. Preserve that behavior,
+    # except never overwrite an existing AAII document after config corruption.
+    if config_error is not None:
+        existing_out = os.path.expanduser(args.out or os.environ.get("KFCHOW_RUNGS_OUT", default_out()))
+        prior_mode = None
+        try:
+            with open(existing_out, encoding="utf-8") as fh:
+                prior = json.load(fh)
+            prior_mode = prior.get("ladder_mode") if isinstance(prior, dict) else None
+        except (OSError, ValueError):
+            pass
+        if args.ladder_mode == "aaii_bands" or prior_mode == "aaii_bands":
+            print("resolver failed: invalid config: %s — keeping last good file" % config_error,
+                  file=sys.stderr)
+            return 1
+    mode = args.ladder_mode or config.get("ladder_mode") or "legacy"
+    if mode not in ("legacy", "aaii_bands"):
+        print("resolver failed: unknown ladder_mode %r — keeping last good file" % mode, file=sys.stderr)
+        return 1
+    if args.out is None:
+        args.out = (os.environ.get("KFCHOW_RUNGS_OUT") or
+                    (config.get("rungs_path") if mode == "aaii_bands" else None) or default_out())
+    if mode == "aaii_bands":
+        return run_aaii(args, config, board_fetcher=fetch_board,
+                        catalog_fetcher=fetch_catalog, prober=probe_model)
 
     try:
         xml = fetch(args.feed_url)

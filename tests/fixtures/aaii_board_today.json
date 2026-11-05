@@ -1,0 +1,15 @@
+{
+  "updated_at": "2026-11-03T04:12:26Z",
+  "models": [
+    {"id": "openai/gpt-6.1-terra", "rank": 4, "intelligence_score": 51,
+     "pricing": {"blended": 1.9892, "blended_lowest": 1.5012}},
+    {"id": "google/gemini-4-argon", "rank": 6, "intelligence_score": 50,
+     "pricing": {"blended": 3.6509, "blended_lowest": 1.5012}},
+    {"id": "minimax/minimax-m3.1-flash", "rank": 10, "intelligence_score": 29,
+     "pricing": {"blended": 0.1777, "blended_lowest": 0.0639}},
+    {"id": "reflection/beam-1.0-501b-a23b", "rank": null, "intelligence_score": 18,
+     "pricing": {"blended": 0.3808, "blended_lowest": 0.3325}},
+    {"id": "fixture/unknown-free:free", "rank": null, "intelligence_score": null,
+     "pricing": {"blended": 0.0, "blended_lowest": 0.0}}
+  ]
+}

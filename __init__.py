@@ -2,12 +2,14 @@
 
 WHAT IT DOES
     On the FIRST provider call of each turn, asks Jev (TypeSafe System One)
-    which pool the turn belongs to, then routes it down a 4-TIER ladder:
-    free (routine, conf >= free gate), flash (near-routine, flash_gate <=
-    conf < free gate), mid (stays on the configured model), premium (strong
-    turns escalate, credit-probed). In `shadow` mode it only records the
-    decision; in `live` mode it rewrites the request's model to the tier's
-    rung.
+    which pool the turn belongs to, then routes it down a 4-TIER ladder.
+    With the example gates (0.35, 0.65, 0.80), free-pool verdicts route to
+    free below 0.35 or at/above 0.80, flash at 0.35–0.65, and mid at
+    0.65–0.80. Paid-pool verdicts below 0.80 stay on the source model; at or
+    above 0.80 they may escalate to premium, credit-probed. The explicit
+    paid_pool_routine_band opt-in restores the v1.0.10 low-band behavior.
+    In `shadow` mode it only records the decision; in `live` mode it rewrites
+    the request's model to the tier's rung.
 
     An ESCALATION path runs the other direction: when a turn starts on a "mid"
     rung and the classifier says it needs a strong model, the request can be
@@ -70,8 +72,8 @@ SAFETY CONTRACT (every one of these is enforced in code, not convention)
       reapply path.
     * A rewrite NEVER crosses providers: the rungs are resolved per provider,
       so the model id sent always belongs to the originating provider's API.
-    * Mode is `live` here, and the real switch is the Desktop plugin-settings
-      panel (v1.0.9): `enabled` / `mode` / `confidence_gate` are read from the
+    * Mode defaults to `shadow`; the Desktop plugin-settings panel (v1.0.9)
+      can override it. `enabled` / `mode` / `confidence_gate` are read from the
       plugin-settings store every turn and win over this JSON file, which
       remains the fallback and the owner of everything else (rungs, gates not
       exposed in the panel, providers).
@@ -90,6 +92,7 @@ Config: ~/.hermes/jev/lane2_config.json       Log: ~/.hermes/jev/lane2-live.json
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -107,11 +110,10 @@ ROUTING_QUESTION_ID = "routing_tier"
 JEV_TIMEOUT_S = 10          # keep well under a turn's own latency budget
 DEFAULT_GATE = 0.80
 DEFAULT_EXCERPT_CHARS = 1200
-# FLASH TIER (v1.0.6, the 4-tier ladder). free-pool turns BELOW the free gate
-# but at or above the flash gate are near-routine work a small paid-by-token
-# workhorse handles adequately — far cheaper than keeping them on the mid rung,
-# and never a downgrade of a paid-pool verdict (those stay mid below the
-# escalation gate). Below the flash gate: mid (no rewrite).
+# Free-pool confidence in [flash_gate, confidence_gate) uses flash; below
+# flash_gate uses free. Paid-pool turns below the escalation gate stay on their
+# source by default, including below flash_gate (paid_pool_routine_band opts
+# back into the v1.0.10 pool-agnostic routine band).
 DEFAULT_FLASH_GATE = 0.35
 # SOURCE-AGNOSTIC LADDER (v1.0.7): eligibility is provider-match only, so any
 # default model (premium, mid, flash, foreign) moves both up and down its own
@@ -246,6 +248,7 @@ def _paid_lane_alive():
 
 def _load_config():
     cfg = {"enabled": True, "mode": "shadow", "confidence_gate": DEFAULT_GATE,
+           "ladder_mode": "legacy",
            "route_providers": ["nous"],
            "route_models": [],
            # v1.0.7: "any" = provider-match eligibility (source-agnostic);
@@ -254,6 +257,7 @@ def _load_config():
            "source_mode": DEFAULT_SOURCE_MODE,
            "free_model": "",
            "flash_gate": DEFAULT_FLASH_GATE,
+           "paid_pool_routine_band": False,
            "escalate_enabled": True,
            "escalate_providers": [],
            "escalate_models": [],
@@ -282,11 +286,73 @@ def _load_config():
                 val = None  # fail-open: a broken settings read changes nothing
             if val is not None:
                 cfg[key] = val
+    if cfg.get("ladder_mode") == "aaii_bands":
+        # The resolver writes this document atomically. A missing or invalid
+        # document disables AAII rewrites rather than guessing at a tier.
+        path = cfg.get("rungs_path") or os.path.join(_HERMES_HOME, "jev", "llm_rungs.json")
+        try:
+            with open(os.path.expandvars(os.path.expanduser(path)), encoding="utf-8") as fh:
+                cfg["_ladder_document"] = json.load(fh)
+        except (OSError, ValueError, TypeError):
+            cfg["_ladder_document"] = None
     return cfg
+
+
+def _band_rung(cfg, provider, key):
+    """Resolve an active AAII rung, skipping dormant slots, never premium."""
+    document = cfg.get("_ladder_document")
+    if (provider != "nous" or not isinstance(document, dict)
+            or document.get("ladder_mode") != "aaii_bands"
+            or document.get("provider") != provider):
+        return None
+    tiers = document.get("tiers")
+    if not isinstance(tiers, dict):
+        return None
+    order = ("premium", "mid", "flash", "free")
+    required = {"model", "price_avg", "aaii", "status", "collapsed_into",
+                "reason", "fold_streak", "rewrite_allowed"}
+    for index, name in enumerate(order):
+        entry = tiers.get(name)
+        if (not isinstance(entry, dict) or not required.issubset(entry)
+                or not isinstance(entry["model"], str) or not entry["model"].strip()
+                or entry["status"] not in ("active", "collapsed")
+                or not isinstance(entry["reason"], str) or not entry["reason"]
+                or not isinstance(entry["fold_streak"], int)
+                or isinstance(entry["fold_streak"], bool) or entry["fold_streak"] < 0
+                or not isinstance(entry["rewrite_allowed"], bool)):
+            return None
+        for field in ("price_avg", "aaii"):
+            value = entry[field]
+            if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))
+                                      or not math.isfinite(value) or value < 0):
+                return None
+        if entry["status"] == "collapsed":
+            if index == 0 or entry["collapsed_into"] != order[index - 1] or entry["rewrite_allowed"]:
+                return None
+        elif entry["collapsed_into"] is not None:
+            return None
+    if key not in order:
+        return None
+    premium = tiers["premium"]["model"]
+    choices = ("premium",) if key == "premium" else order[order.index(key):]
+    for name in choices:
+        entry = tiers[name]
+        if entry["status"] != "active" or not entry["rewrite_allowed"]:
+            continue
+        # A lower band may fall to a cheaper active slot, never to the premium
+        # pin even if another slot happens to hold the same model id.
+        if key != "premium" and _same_model(entry["model"], premium):
+            continue
+        return entry["model"]
+    return None
 
 
 def _rung(cfg, provider, key, fallback_key):
     """Per-provider rung with a flat-key fallback. Keeps a rewrite same-provider."""
+    if cfg.get("ladder_mode") == "aaii_bands":
+        return _band_rung(cfg, provider, key)
+    if cfg.get("ladder_mode") not in (None, "", "legacy"):
+        return None  # an unknown opt-in must not silently use unchecked pins
     rungs = cfg.get("rungs") or {}
     entry = rungs.get(provider) or {}
     val = entry.get(key)
@@ -343,6 +409,22 @@ def _source_eligibility(cfg, provider, model):
     # "allowlist", or anything unrecognised: v1.0.6 behaviour.
     return (route_ok and model in (cfg.get("route_models") or [])), \
            (esc_ok and model in (cfg.get("escalate_models") or []))
+
+
+def _cached_provider_eligible(cfg, provider, decision, target=None, source_model=""):
+    """Re-check the original source's lane and any refreshed AAII rung."""
+    if decision not in ("free", "mid", "flash", "paid"):
+        return True  # a cached no-op needs no provider call
+    free_src, esc_src = _source_eligibility(cfg, provider, source_model)
+    lane_ok = esc_src if decision == "paid" else free_src
+    if not lane_ok or cfg.get("ladder_mode") not in (None, "", "legacy", "aaii_bands"):
+        return False
+    if cfg.get("ladder_mode") == "aaii_bands":
+        # If a refresh folded a slot or changed its target, do not replay an
+        # old cached target. Stay on source until the next turn is classified.
+        tier = "premium" if decision == "paid" else decision
+        return bool(target) and _rung(cfg, provider, tier, tier + "_model") == target
+    return True
 
 
 def _same_model(a, b):
@@ -536,9 +618,11 @@ def on_llm_request(**kwargs):
                 _DECISIONS.move_to_end(key)
 
         if known is not None:
-            # Established decision: never classify again, never recompute
-            # eligibility, and NEVER route across providers.
-            if provider != known["provider"]:
+            # Never classify again or route across providers. Provider scope is
+            # hot-read, so a removed lane stops applying even mid-turn.
+            if (provider != known["provider"]
+                    or not _cached_provider_eligible(cfg, provider, known["decision"],
+                                                     known.get("target"), known.get("source_model", model))):
                 return None
             if str(cfg.get("mode", "shadow")).lower() != "live":
                 return None  # shadow: follow-ups never rewritten, no extra rows
@@ -662,7 +746,9 @@ def on_llm_request(**kwargs):
         except (TypeError, ValueError):
             flash_gate = DEFAULT_FLASH_GATE
         flash_model = _rung(cfg, provider, "flash", "flash_model")
-        flash_band = (pool == "free" and confidence is not None
+        # The early source check accepts either lane; downgrade bands must
+        # additionally satisfy the routing lane's full free_src eligibility.
+        flash_band = (free_src and pool == "free" and confidence is not None
                       and flash_gate <= float(confidence) < gate
                       and bool(flash_model))
         # v1.0.7 identity guard: a turn is never "moved" onto the model it is
@@ -711,20 +797,21 @@ def on_llm_request(**kwargs):
         #                            Paid pool in this band still stays mid.
         #   flash_gate <= conf < gate (0.35-0.65): free pool -> flash rung
         #                            (unchanged); paid pool stays mid.
-        #   conf < flash_gate (0.35): FREE RUNG, pool-agnostic (was
-        #                            stay-on-default; Marc: routine turns
-        #                            belong on the $0 model).
+        #   conf < flash_gate (0.35): free-pool -> free rung; paid pool stays
+        #                            on source unless paid_pool_routine_band is
+        #                            explicitly true (v1.0.10 compatibility).
         # The classifier fails open as before: no verdict -> the turn stays on
         # its source model ("stay", logged).
         mid_model = _rung(cfg, provider, "mid", "mid_model")
         if isinstance(mid_model, list):
             mid_model = mid_model[0] if mid_model else None
         conf_f = float(confidence) if confidence is not None else None
-        free_hi_band = (pool == "free" and conf_f is not None
+        free_hi_band = (free_src and pool == "free" and conf_f is not None
                         and conf_f >= esc_gate and bool(free_model))
-        mid_band = (pool == "free" and conf_f is not None
+        mid_band = (free_src and pool == "free" and conf_f is not None
                     and gate <= conf_f < esc_gate and bool(mid_model))
-        free_low_band = (conf_f is not None and conf_f < flash_gate
+        free_low_band = (free_src and conf_f is not None and conf_f < flash_gate
+                         and (pool == "free" or cfg.get("paid_pool_routine_band", False))
                          and bool(free_model))
         eligible = (free_hi_band or free_low_band) and \
             not _same_model(free_model, model)
@@ -748,7 +835,8 @@ def on_llm_request(**kwargs):
                    (mid_model if mid_eligible else
                     (flash_model if flash_eligible else None))))
         _store_decision(key, provider, decision, target,
-                        float(confidence) if confidence is not None else 0.0)
+                        float(confidence) if confidence is not None else 0.0,
+                        source_model=model)
 
         log_feats = feats if cfg.get("send_excerpt", True) else {
             k: v for k, v in feats.items() if k != "task_excerpt"}
@@ -897,7 +985,9 @@ def on_llm_execution(request=None, next_call=None, **context):
         # Unknown / expired turn: execution must not classify. llm_request owns
         # first-call classification (its api_call_count gate fires there); here
         # an unknown key means "no decision yet" — pass the payload untouched.
-        if known is None or provider != known["provider"]:
+        if (known is None or provider != known["provider"]
+                or not _cached_provider_eligible(cfg, provider, known["decision"],
+                                                 known.get("target"), known.get("source_model", model))):
             return _dispatch(request)
 
         decision = known["decision"]
@@ -988,7 +1078,7 @@ def on_llm_execution(request=None, next_call=None, **context):
         raise
 
 
-def _store_decision(key, provider, decision, target, conf):
+def _store_decision(key, provider, decision, target, conf, source_model=""):
     """Record the classified decision for a turn (called AFTER _classify).
 
     Every classified turn gets a row — "free"/"flash"/"paid" carry the
@@ -1000,7 +1090,7 @@ def _store_decision(key, provider, decision, target, conf):
         with _DECISIONS_LOCK:
             _DECISIONS[key] = {"decision": decision, "target": target,
                                "conf": conf, "provider": provider,
-                               "ts": time.monotonic()}
+                               "source_model": source_model, "ts": time.monotonic()}
             _DECISIONS.move_to_end(key)
             while len(_DECISIONS) > _DECISIONS_MAX:
                 _DECISIONS.popitem(last=False)  # evict oldest (LRU)
