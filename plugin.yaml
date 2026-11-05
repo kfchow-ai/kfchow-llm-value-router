@@ -1,5 +1,5 @@
 name: kfchow-llm-value-router
-version: "1.0.10"
+version: "1.0.11"
 description: "Per-turn LLM model routing guided by the KFChow value leaderboard. In live mode the classifier can route free-pool turns to free, flash or mid, and credit-guarded paid-pool turns to premium. Paid turns below flash_gate stay on their source by default; paid_pool_routine_band restores v1.0.10 pool-agnostic routing. Downgrades require the routing lane's provider and source eligibility. Optional ladder_mode aaii_bands uses a probed Nous-only ladder; legacy remains the resolver default. Per-request kill switch, fail-open and shadow-by-default."
 author: KFChow
 license: MIT

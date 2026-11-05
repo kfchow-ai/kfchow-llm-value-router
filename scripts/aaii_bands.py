@@ -1,7 +1,7 @@
 """Opt-in AAII-band resolver. No code here is used by the legacy RSS rule.
 
 Board prices are always pricing.blended. Selection is confined to the Nous
-catalog and an exact-id, one-token probe. The returned document is informational
+catalog and an exact-id, bounded completion probe. The returned document is informational
 until a router explicitly selects ladder_mode=aaii_bands and reads it.
 """
 import copy
@@ -12,6 +12,7 @@ import os
 import statistics
 import sys
 import tempfile
+import urllib.error
 import urllib.request
 
 BOARD_URL = "https://kfchow.com/llm-value-leaderboard/data/models.json"
@@ -66,18 +67,35 @@ def fetch_catalog(key, base_url=NOUS_BASE_URL, timeout=30):
 
 
 def probe_model(model, key, base_url=NOUS_BASE_URL, timeout=15):
-    """Probe the exact model id with one output token; failures disqualify it."""
+    """Return True=servable, False=definitively absent, None=unknown.
+
+    Some Nous models reject max_tokens below 16. HTTP 429/5xx, credit errors,
+    other client errors, malformed responses and transport failures are
+    UNKNOWN; they must not silently promote a more expensive candidate.
+    """
     payload = {"model": model, "messages": [{"role": "user", "content": "ping"}],
-               "max_tokens": 1, "temperature": 0}
+               "max_tokens": 16, "temperature": 0}
     req = urllib.request.Request(base_url.rstrip("/") + "/chat/completions",
         data=json.dumps(payload).encode("utf-8"), method="POST",
         headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
             body = json.loads(response.read().decode("utf-8"))
-        return isinstance(body, dict) and isinstance(body.get("choices"), list) and bool(body["choices"])
-    except Exception:
+        if isinstance(body, dict) and isinstance(body.get("choices"), list) and body["choices"]:
+            return True
+        return None
+    except urllib.error.HTTPError as exc:
+        if exc.code not in (404, 410):
+            return None
+        try:
+            body = exc.read().decode("utf-8", errors="replace").lower()
+        except Exception:
+            return None
+        if exc.code == 404 and "requires available credits" in body:
+            return None
         return False
+    except Exception:
+        return None
 
 
 def _candidate_rows(rows, catalog):
@@ -122,10 +140,13 @@ def _select(tier, candidates, probe, probes):
             break
         if model not in probes:
             try:
-                probes[model] = bool(probe(model))
+                outcome = probe(model)
+                probes[model] = outcome if outcome is True or outcome is False else None
             except Exception:
-                probes[model] = False
-        if probes[model]:
+                probes[model] = None
+        if probes[model] is None:
+            return None  # unknown cheaper/within-window option: retain incumbent
+        if probes[model] is True:
             if cheapest is None:
                 cheapest = price
             qualified.append(candidate)
@@ -355,6 +376,12 @@ def resolve_aaii(board, catalog, probe, previous, now=None, source=BOARD_URL):
                         reason="lowest probed Avg plus 10% tolerance, highest AAII")
         result[tier] = item
 
+    uncertain = [name for name, result in probes.items() if result is None]
+    if uncertain:
+        alerts.append({"tier": "all", "code": "candidate_probe_uncertain",
+                       "message": "At least one probe was unverified; affected candidate selection retained the incumbent.",
+                       "models": sorted(uncertain)})
+
     ratios = {}
     for tier, above_name, threshold in (("mid", "premium", .5), ("flash", "mid", .25)):
         candidate = selected[tier]
@@ -407,7 +434,7 @@ def run_aaii(args, config, board_fetcher=fetch_board, catalog_fetcher=fetch_cata
         previous = initial_state(config, path)
         key = os.environ.get("NOUS_API_KEY")
         if not key:
-            raise ValueError("NOUS_API_KEY is required for catalog and one-token probes")
+            raise ValueError("NOUS_API_KEY is required for catalog and bounded probes")
         catalog = catalog_fetcher(key, args.nous_base_url)
         doc = resolve_aaii(board, catalog,
                            lambda model: prober(model, key, args.nous_base_url),

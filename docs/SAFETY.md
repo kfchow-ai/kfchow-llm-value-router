@@ -58,8 +58,9 @@ The legacy RSS resolver remains the default. `ladder_mode: "aaii_bands"` is an
 explicit opt-in. The resolver uses the full board's `intelligence_score` and
 `pricing.blended` (Avg), not the Lowest column; only AAII ≥ 25 rows with Avg
 are candidates. Candidates must occur in the Nous model catalog (or have a
-catalogued `:free` variant) and pass an exact-ID one-token probe before being
-selected. These probes can incur charges, including in `--dry-run`.
+catalogued `:free` variant) and pass a bounded exact-ID completion probe before
+being selected. Unknown outcomes retain the incumbent instead of promoting a
+more expensive candidate. These probes can incur charges, including in `--dry-run`.
 
 All four current Nous pins must exist before initialization. The resolver
 retains a pin and reports an alert if no candidate qualifies, and records the
@@ -94,22 +95,22 @@ callback.
 | `GET https://kfchow.com/llm-value-leaderboard/feed.xml` | Operator runs the legacy resolver | No task data | None |
 | `GET https://kfchow.com/llm-value-leaderboard/data/models.json` | Operator runs the opt-in AAII resolver | No task data | None |
 | `GET <nous>/v1/models` | AAII refresh, including dry-run | No task data | `NOUS_API_KEY` |
-| `POST <nous>/v1/chat/completions`, one-token ping | AAII candidate verification, including dry-run | Exact candidate ID and literal `ping` | `NOUS_API_KEY` |
+| `POST <nous>/v1/chat/completions`, up-to-16-token ping | AAII candidate verification, including dry-run | Exact candidate ID and literal `ping` | `NOUS_API_KEY` |
 
 There is no analytics or telemetry upload beyond these calls. The board and
 Nous URLs can be overridden as documented in the README.
 
 ## Reads and writes
 
-- Reads `~/.hermes/jev/lane2_config.json` (under `HERMES_HOME` if set), the
-  AAII rung file when opted in, and the relevant environment variables.
+- Reads the lane2 configuration from the configured Hermes home, the AAII rung
+  file when opted in, and the relevant environment variables.
 - `NOUS_API_KEY` is read from the process environment, not `.env` directly.
   The vendored Jev client reads `JEVI_API_KEY` first and can fall back to its
-  own user-provided `~/.hermes/secrets/jev.creds` file.
-- Writes local `~/.hermes/jev/lane2-live.jsonl` (0600); with
+  own user-provided credentials file.
+- Writes a local decision log under the configured Hermes home (0600); with
   `send_excerpt: true` this can include the task excerpt.
-- The resolver writes `~/.hermes/jev/llm_rungs.json` or the configured output
-  path only when explicitly run. AAII price history is kept in that document.
+- The resolver writes the configured rung output file or its Hermes-home
+  default only when explicitly run. AAII price history is kept in that document.
 - Never logs or transmits key values except as the required authorization
   headers to the selected service endpoint.
 

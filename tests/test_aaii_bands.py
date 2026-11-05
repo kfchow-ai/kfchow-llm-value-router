@@ -5,8 +5,10 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+from email.message import Message
 
 import pytest
+from urllib.error import HTTPError
 import aaii_bands
 
 ROOT = Path(__file__).parents[1]
@@ -240,15 +242,44 @@ def test_shadow_price_jump_over_twice_in_one_day(board, prior):
     assert any(a["model"] == PREMIUM and a["kind"] == "jump_1d" for a in result["shadow"]["price_moves"])
 
 
-def test_probe_uses_one_token_and_exact_model(monkeypatch):
+def test_probe_uses_bounded_tokens_and_exact_model(monkeypatch):
     calls = []
     def fake_open(request, timeout):
         calls.append((request.full_url, json.loads(request.data), timeout))
         return io.BytesIO(b'{"choices":[{"message":{"content":"ok"}}]}')
     monkeypatch.setattr(resolver.urllib.request, "urlopen", fake_open)
     assert resolver.probe_model("fixture/model:free", "synthetic", "https://unit.invalid/v1")
-    assert calls[0][1]["max_tokens"] == 1
+    assert calls[0][1]["max_tokens"] == 16
     assert calls[0][1]["model"] == "fixture/model:free"
+
+
+def test_low_token_rejecting_model_is_servable_with_16(monkeypatch):
+    requests = []
+    def fake_open(request, timeout):
+        payload = json.loads(request.data)
+        requests.append(payload)
+        if payload["max_tokens"] < 16:
+            raise HTTPError(request.full_url, 400, "minimum 16", Message(), io.BytesIO(b"minimum 16"))
+        return io.BytesIO(b'{"choices":[{"message":{"content":"ok"}}]}')
+    monkeypatch.setattr(aaii_bands.urllib.request, "urlopen", fake_open)
+    assert aaii_bands.probe_model("fixture/paid", "synthetic", "https://unit.invalid/v1") is True
+    assert requests[0]["max_tokens"] == 16
+
+
+def test_unknown_cheapest_keeps_distinct_incumbent(board, prior):
+    board["models"].extend([model("fixture/cheap-uncertain", 51, .1),
+                            model("fixture/expensive-alive", 58, .2)])
+    ids = CATALOG | {"fixture/cheap-uncertain", "fixture/expensive-alive"}
+    attempts = []
+    def probe(model_id):
+        attempts.append(model_id)
+        return None if model_id == "fixture/cheap-uncertain" else True
+    result = run(board, prior, ids, probe)
+    assert result["tiers"]["premium"]["model"] == PREMIUM
+    assert result["tiers"]["premium"]["candidate"] is None
+    assert "fixture/expensive-alive" not in attempts
+    assert any(a["code"] == "candidate_probe_uncertain" and
+               "fixture/cheap-uncertain" in a["models"] for a in result["alerts"])
 
 
 def test_config_selects_aaii_mode_and_persists_fold_streak(monkeypatch, tmp_path, board):
@@ -292,7 +323,7 @@ def test_full_cli_request_shapes_with_fake_http(monkeypatch, tmp_path, board):
             payload = {"data": [{"id": mid} for mid in CATALOG]}
         elif request.full_url == "https://nous.invalid/v1/chat/completions":
             body = json.loads(request.data)
-            assert body["max_tokens"] == 1 and body["model"] in CATALOG
+            assert body["max_tokens"] == 16 and body["model"] in CATALOG
             payload = {"choices": [{"message": {"content": "ok"}}]}
         else:
             pytest.fail("unexpected URL: " + request.full_url)
@@ -304,7 +335,7 @@ def test_full_cli_request_shapes_with_fake_http(monkeypatch, tmp_path, board):
     doc = json.loads(out.read_text())
     assert doc["tiers"]["mid"]["fold_streak"] == 1
     probes = [r for r in calls if r.full_url.endswith("/chat/completions")]
-    assert probes and all(json.loads(r.data)["max_tokens"] == 1 for r in probes)
+    assert probes and all(json.loads(r.data)["max_tokens"] == 16 for r in probes)
     assert all(r.get_header("Authorization") == "Bearer synthetic"
                for r in calls if r.full_url.startswith("https://nous.invalid/"))
 

@@ -52,12 +52,12 @@ Legacy remains the default. To opt in, provide a lane2 JSON with
 for a single resolver invocation. The override does not change router config.
 
 The resolver selects from all scored board rows using `pricing.blended` (Avg),
-not Lowest; requires a Nous catalog match plus an exact-ID one-token probe; and
+not Lowest; requires a Nous catalog match plus a bounded exact-ID completion probe; and
 persists two-refresh dominance hysteresis, shadow ratio/price alerts, and
 per-tier status. A collapsed tier is never a rewrite target. Missing candidates
 retain pins and alert; bad board/schema/catalog data exits non-zero without
 replacing the last good file. `--dry-run` does not write but still runs the
-one-token probes, which may cost money. The AAII mode requires `NOUS_API_KEY`.
+one 16-token-maximum completion probe per candidate, which may cost money. The AAII mode requires `NOUS_API_KEY`.
 See the repository README for the exact bands and routing integration.
 
 ## Pitfalls (learned the hard way — do not re-learn them)
@@ -96,7 +96,7 @@ partial parse must never overwrite a working set of rungs.
 ## Privacy notes
 
 - Network: legacy fetches the public leaderboard feed. Opt-in AAII mode also
-  fetches the public board and authenticated Nous catalog and sends one-token
-  `ping` probes to Nous. It sends no task content in resolver calls.
+  fetches the public board and authenticated Nous catalog and sends bounded
+  completion `ping` probes (up to 16 tokens) to Nous. It sends no task content in resolver calls.
 - Reads: configured URLs and (in AAII mode) `NOUS_API_KEY`; writes: the rungs
   JSON path you choose, including persisted fold and board-price history.

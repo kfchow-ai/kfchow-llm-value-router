@@ -194,8 +194,8 @@ To use the new resolver, put `"ladder_mode": "aaii_bands"` in
 `lane2_config.json` and fill **all four existing** `rungs.nous` pins first.
 Those are the retention baseline if the board has no qualifying candidate;
 the resolver will not create an incomplete ladder. Optionally set
-`rungs_path` to the intended output path; otherwise it defaults to
-`$HERMES_HOME/jev/llm_rungs.json` (or `~/.hermes/jev/llm_rungs.json`).
+`rungs_path` to the intended output path; otherwise the resolver uses its
+Hermes-home-relative default.
 Keep `route_providers` and `escalate_providers` explicitly scoped to the
 providers you intend to use. The AAII document itself is Nous-only.
 
@@ -219,7 +219,9 @@ and uses only `intelligence_score` (AAII) and `pricing.blended` (Avg); it never
 uses `blended_lowest` as a price substitute. Rows without Avg or with missing
 or sub-25 AAII are excluded. Bands are premium AAII > 50, mid 40–50, flash 25–<40, and free
 zero-price or `:free` IDs with AAII ≥ 25. An ID, or its `:free` variant, must
-be in the Nous `/v1/models` catalog and pass a one-token probe. Among the
+be in the Nous `/v1/models` catalog and pass a bounded completion probe (up to
+16 output tokens). Unknown probe outcomes retain the incumbent rather than
+silently selecting a dearer candidate. Among the
 probe-green candidates, find the lowest Avg and choose the highest AAII among
 those within 10% of that price; ties break by lower Avg then model ID. Probes
 may incur charges, **including in dry-run**.

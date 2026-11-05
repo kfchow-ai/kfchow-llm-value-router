@@ -21,7 +21,7 @@ Run:    python3 llm-rank-resolver.py            # resolve + write
 Exit 0 on success, 1 if the feed can't be parsed (the caller keeps the last
 good file — it must never be overwritten with a partial parse). The optional
 ladder_mode=aaii_bands reads the full JSON board, checks the Nous catalog and
-one-token probes, and persists four tiers with fold state; see aaii_bands.py.
+one 16-token-maximum completion probe per candidate, and persists four tiers with fold state; see aaii_bands.py.
 """
 import argparse
 import json
