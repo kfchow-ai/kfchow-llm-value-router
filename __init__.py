@@ -140,10 +140,14 @@ POOL_CRITERIA = {
 }
 
 # A turn already on a free/trial model must never be "routed" again.
-# v1.0.11 (2026-11-12): dropped the "space-bunny" hint — that model retired
-# (400 "Model is unavailable"). "free" already matches every free id on both
-# lanes (":free" contains "free"; Go's longcat-2.5-free carries the suffix).
-_FREE_HINTS = (":free", "free")
+#
+# RETIRED IDS STAY LISTED ON PURPOSE — Marc's rule: retire = mark it known-dead,
+# never erase the name. "space-bunny" retired everywhere on 2026-11-12 (probed
+# HTTP 400 "Upstream request failed: Model is unavailable."), but it stays
+# hinted so that (a) a lingering session still on the retired id is recognised
+# as free-tier and left alone, and (b) the retirement stays visible to anyone
+# auditing this file, instead of looking like the model was never considered.
+_FREE_HINTS = (":free", "free", "space-bunny")
 
 # PER-REQUEST KILL SWITCH (v1.0.8). A client can disable routing for its own
 # request with NO config edit and zero blast radius on other turns. The flag
