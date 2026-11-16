@@ -118,6 +118,14 @@ DEFAULT_FLASH_GATE = 0.35
 # provider's rungs. "allowlist" restores the v1.0.6 model-allowlist gate.
 DEFAULT_SOURCE_MODE = "any"
 
+# FREE-DEFAULT ROUTE-UP (v1.0.12, Marc 2026-11-16). The free rung is the DEFAULT
+# rung: a turn already on a free model is the routine case, not a special case
+# to skip. With the guard below disabled, a free-source turn is classified like
+# any other and can be routed UP on a hard verdict (0.65-0.80 -> mid,
+# 0.80+ -> premium) and stays free on an easy one. Opt-out: false restores the
+# v1.0.11 behaviour (skip before the classifier, log already_free_tier).
+FREE_DEFAULT_ROUTE_UP = True
+
 # PANEL-WIRED SWITCH (v1.0.9). The Desktop plugin-settings panel writes
 # plugins.entries.<id>.settings.<key> into config.yaml — a store the router
 # historically never read, so the panel rendered config_schema defaults and its
@@ -273,7 +281,11 @@ def _load_config():
            # request's base_url/api_key belong to the originating provider, so
            # swapping only the model id would send the wrong id to the wrong
            # endpoint. Resolved per provider, falling back to the flat keys.
-           "rungs": {}}
+           "rungs": {},
+           # v1.0.12: free is the DEFAULT rung, so a free-source turn is
+           # classified and can route UP on a hard verdict. See
+           # FREE_DEFAULT_ROUTE_UP. Absent/false = v1.0.11 skip-first.
+           "free_default_route_up": FREE_DEFAULT_ROUTE_UP}
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
             cfg.update(json.load(fh) or {})
@@ -636,10 +648,18 @@ def on_llm_request(**kwargs):
         # was a real bug: the free path's route_models filter rejected the mid
         # model before escalation ever ran, so escalation could never fire.
         # Evaluate each path on its own lane.
-        # _FREE_HINTS guard runs FIRST, ahead of every eligibility rule: a
-        # source already on a free model is never rewritten (logs
-        # already_free_tier, not *_not_eligible), whatever source_mode says.
-        if any(h in model.lower() for h in _FREE_HINTS):
+        # _FREE_HINTS guard: a source already on a free model is never
+        # rewritten DOWNWARD (nothing below the free rung exists). Since
+        # v1.0.12 a free source that IS the configured free rung is classified
+        # so a hard verdict can route it UP. A free source that is NOT the
+        # configured free rung (a stray/pinned id) still skips before the
+        # classifier — it has no rung to route to, so classifying it would only
+        # send an excerpt for nothing.
+        free_source = any(h in model.lower() for h in _FREE_HINTS)
+        free_default_rung = _rung(cfg, provider, "free", "free_model")
+        if free_source and not (
+                cfg.get("free_default_route_up", FREE_DEFAULT_ROUTE_UP)
+                and _same_model(free_default_rung, model)):
             return _skip("already_free_tier")
         # v1.0.7 SOURCE-AGNOSTIC: eligibility is PROVIDER-match only by
         # default (source_mode "any"), so a premium-, mid-, flash- or
@@ -653,6 +673,17 @@ def on_llm_request(**kwargs):
             return _skip("model_not_eligible")
         if not request.get("model"):
             return _skip("no_model_in_request")
+
+        # ---- NO EGRESS WITHOUT A CONFIGURED RUNG (v1.0.12) ------------------
+        # The classifier sends task text (up to excerpt_chars) to the vendor.
+        # If this provider has NO rung resolved — no lane2_config.json, or the
+        # config names no free/flash/mid/premium rung for it — there is nothing
+        # to route to, so classifying would only ship an excerpt for nothing.
+        # Skip the classifier AND the excerpt log row. A configured install is
+        # unaffected (the live config resolves all four rungs).
+        if not any(_rung(cfg, provider, k, k + "_model")
+                   for k in ("free", "flash", "mid", "premium")):
+            return _skip("no_rungs_configured")
 
         feats = _features(request, excerpt_chars=int(cfg.get("excerpt_chars",
                                                              DEFAULT_EXCERPT_CHARS)),
@@ -737,8 +768,13 @@ def on_llm_request(**kwargs):
         conf_f = float(confidence) if confidence is not None else None
         free_hi_band = (free_src and pool == "free" and conf_f is not None
                         and conf_f >= esc_gate and bool(free_model))
-        mid_band = (free_src and pool == "free" and conf_f is not None
-                    and gate <= conf_f < esc_gate and bool(mid_model))
+        # v1.0.12: free is the DEFAULT rung, so a free-source turn can move UP.
+        # The free-pool mid band below already covers 0.65-0.80 (Marc's Mid
+        # tier) for any source; the flash band and the premium escalation are
+        # the other up-moves. Route-up only — never a downgrade to the free rung.
+        mid_band = (free_src and conf_f is not None
+                    and gate <= conf_f < esc_gate and bool(mid_model)
+                    and pool == "free")
         # D7 (Marc 2026-11-03): the routine band is FREE-POOL ONLY by default.
         # A paid-pool verdict below flash_gate stays on its SOURCE model
         # instead of being downgraded to the free rung. The v1.0.10
@@ -748,8 +784,23 @@ def on_llm_request(**kwargs):
                          and (pool == "free"
                               or bool(cfg.get("paid_pool_routine_band", False)))
                          and bool(free_model))
+        # v1.0.12 free-source route-up, applied AFTER the v1.0.10 bands:
+        #   free source, easy verdict  -> stays on free (routine band)
+        #   free source, 0.35-0.65     -> flash (near-routine, off the $0 model)
+        #   free source, 0.65-0.80     -> mid
+        #   free source, 0.80+ paid    -> premium (existing escalation path)
+        # Never downgrades a free source and never moves it onto the free rung.
         eligible = (free_hi_band or free_low_band) and \
             not _same_model(free_model, model)
+        if free_source and cfg.get("free_default_route_up", FREE_DEFAULT_ROUTE_UP):
+            eligible = False                           # no free->free rewrite
+            # Flash is a DOWNGRADE rung for paid-pool verdicts (D7), so the
+            # route-up only fires when the classifier vouches the turn is
+            # near-routine (free pool, 0.35-0.65). A paid verdict in that band
+            # stays on the free rung.
+            if pool == "free" and conf_f is not None and flash_gate <= conf_f < gate \
+                    and flash_model and not _same_model(flash_model, model):
+                flash_eligible = True                  # 0.35-0.65 -> flash
         mid_eligible = mid_band and not _same_model(mid_model, model)
         # True when a tier fired but its rung IS the source model (identity
         # guard above): logged as already_on_target, nothing rewritten.
@@ -784,8 +835,12 @@ def on_llm_request(**kwargs):
               "tier": decision if decision != "none" else "stay",
               "skip_reason": None if (eligible or mid_eligible or flash_eligible
                                       or esc_eligible) else (
+                  # v1.0.12: a free-source turn that stays put is the free
+                  # DEFAULT holding, not a gate miss.
+                  "already_free_tier" if (free_source and cfg.get(
+                      "free_default_route_up", FREE_DEFAULT_ROUTE_UP)) else (
                   "already_on_target" if on_target else (
-                      "below_gate" if pool == "free" else "pool_paid")),
+                      "below_gate" if pool == "free" else "pool_paid"))),
               "escalate_eligible": esc_eligible,
               "escalate_applied": bool(esc_eligible and mode == "live"),
               "mid_model": mid_model if mid_eligible else None,
