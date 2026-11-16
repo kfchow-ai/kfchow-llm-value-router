@@ -568,18 +568,92 @@ def test_gpt54_default_paid_085_blocked_when_credits_dead(monkeypatch):
     assert recs[-1]["credit_ok"] is False and recs[-1]["escalate_applied"] is False
 
 
-# ---- ling:free default: _FREE_HINTS precedence over source-agnostic --------
+# ---- ling:free default: free is the DEFAULT rung (v1.0.12 route-up) -------
+# Marc 2026-11-16: free by default, route up on hard tasks. A free-source turn
+# is therefore classified; easy verdicts hold on the free rung, harder ones
+# move up (0.35-0.65 -> flash, 0.65-0.80 -> mid, 0.80+ paid -> premium).
+# free_default_route_up=false restores the v1.0.11 skip-before-classify
+# (covered by test_already_free_model_never_rerouted).
+
+_FREE_ROUTE_UP_EXPECT = {
+    ("paid", 0.99): _SONNET, ("paid", 0.85): _SONNET,
+    ("free", 0.99): None, ("free", 0.65): _MID, ("free", 0.50): _FLASH,
+    ("free", 0.10): None,
+}
+
 
 @pytest.mark.parametrize("mode", ["any", "allowlist", [_LING], "bogus"])
 @pytest.mark.parametrize("pool,conf", [("paid", 0.99), ("paid", 0.85), ("free", 0.99),
                                        ("free", 0.65), ("free", 0.50), ("free", 0.10)])
-def test_ling_free_default_never_touched(monkeypatch, mode, pool, conf):
+def test_ling_free_default_routes_up_on_hard_verdicts(monkeypatch, mode, pool, conf):
+    want = _FREE_ROUTE_UP_EXPECT[(pool, conf)]
     out, row, probes, classified = _run7(monkeypatch, _LING, pool, conf,
-                                         "l7-%s-%s-%s" % (str(mode)[:6], pool, conf),
+                                         "l8-%s-%s-%s" % (str(mode)[:6], pool, conf),
                                          source_mode=mode, route_models=[_LING],
                                          escalate_models=[_LING])
+    got = (out["request"]["model"] if out else None)
+    assert got == want, (mode, pool, conf, got, want)
+    if want is None:
+        # holds on the free rung: classified, never moved, never probed
+        assert classified == [1] and probes == []
+        assert row["skip_reason"] == "already_free_tier"
+    elif want == _SONNET:
+        assert row["escalate_applied"] is True and probes == [1]
+    else:
+        assert row["applied"] is True and probes == []
+
+
+def test_free_default_route_up_paid_low_band_stays_free(monkeypatch):
+    # A paid verdict below the escalation gate is NOT a route-up trigger: the
+    # v1.0.10 D7 rule (paid pool stays) still holds for a free source.
+    out, row, probes, classified = _run7(monkeypatch, _LING, "paid", 0.70, "l8-paid70")
+    assert out is None and row["skip_reason"] == "already_free_tier"
+    assert classified == [1] and probes == []
+
+
+def test_free_default_route_up_credit_dead_blocks_escalation(monkeypatch):
+    # Route-up to premium is credit-gated like every escalation: a dark paid
+    # lane must leave the turn on the free rung, never fail it.
+    probes = []
+    monkeypatch.setattr(pl, "_load_config",
+                        lambda: _cfg7(free_default_route_up=True))
+    monkeypatch.setattr(pl, "_classify", lambda f, c: ("paid", 0.99))
+    monkeypatch.setattr(pl, "_paid_lane_alive", lambda: probes.append(1) or False)
+    monkeypatch.setattr(pl, "_log", lambda rec: None)
+    _reset_decisions()
+    out = pl.on_llm_request(**_kwargs(model=_LING, turn_id="l8-credit"))
+    assert out is None                                  # stays on the free rung
+    assert probes == [1]                                # probed once, failed
+    assert pl._DECISIONS["s1:l8-credit"]["decision"] == "none"
+
+
+def test_free_default_route_up_paid_mid_band_does_not_downgrade(monkeypatch):
+    # D7 holds for a free source too: a PAID verdict in 0.35-0.65 must NOT be
+    # pushed onto the flash rung (flash is a downgrade rung for paid verdicts).
+    out, row, probes, classified = _run7(monkeypatch, _LING, "paid", 0.50, "l8-paid50")
+    assert out is None and row["skip_reason"] == "already_free_tier"
+    assert classified == [1] and probes == []
+
+
+def test_no_rungs_configured_skips_classifier_and_excerpt(monkeypatch):
+    # v1.0.12 no-egress guard: with no rung resolved for the provider the
+    # classifier must never run (no vendor call, no excerpt leaves the box).
+    classified = []
+    monkeypatch.setattr(pl, "_load_config", lambda: _cfg7(
+        free_model="", flash_model="", mid_model="", premium_model="",
+        rungs={}))
+    monkeypatch.setattr(pl, "_classify", lambda f, c: classified.append(1) or ("paid", 0.9))
+    monkeypatch.setattr(pl, "_log", lambda rec: None)
+    _reset_decisions()
+    out = pl.on_llm_request(**_kwargs(model=_SONNET, turn_id="l9-norungs"))
     assert out is None
-    assert row["skip_reason"] == "already_free_tier"
+    assert classified == []
+
+
+def test_free_source_route_up_off_restores_v1011_skip(monkeypatch):
+    out, row, probes, classified = _run7(monkeypatch, _LING, "paid", 0.99, "l8-off",
+                                         free_default_route_up=False)
+    assert out is None and row["skip_reason"] == "already_free_tier"
     assert classified == [] and probes == []              # never even classified
 
 
@@ -853,10 +927,11 @@ def test_routine_band_paid_pool_opt_in_restores_v1010_behaviour(monkeypatch):
 
 
 def test_routine_band_stays_when_source_is_free_model(monkeypatch):
-    # _FREE_HINTS top guard: an already-free source is never rewritten.
+    # v1.0.12: a free-source turn is CLASSIFIED, but an easy verdict (free
+    # pool, below the flash gate) holds on the free rung. Never moved down.
     out, row, _, classified = _run7(monkeypatch, _LING, "free", 0.20, "r7-low-s")
     assert out is None and row["skip_reason"] == "already_free_tier"
-    assert classified == []
+    assert classified == [1]
 
 
 def test_reapply_sonnet_default_mid_downmove_via_request_and_exec(monkeypatch):
