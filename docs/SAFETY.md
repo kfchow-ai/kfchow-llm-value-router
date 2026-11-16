@@ -23,8 +23,10 @@ Concretely enforced:
   default model moves both ways on its own provider's rungs); `"allowlist"` =
   exact v1.0.6 model allowlists (`route_models` / `escalate_models`); or an
   explicit list of model ids. An unrecognised value falls back to
-  `"allowlist"` (fewer turns touched, never more) with a one-time warning. A
-  source already on a free model is skipped first, in every mode.
+  `"allowlist"` (fewer turns touched, never more) with a one-time warning.
+  A free source that is NOT the configured free rung is skipped before the
+  classifier (no rung to route to); a free source ON the configured free rung
+  is classified so a hard verdict can route it up (v1.0.12).
 - **Per-request kill switch (v1.0.8):** a request that carries the disabling
   flag (`X-KFC-Router` header or a `router` body field) is skipped FIRST, in
   both middlewares and on every callback — no rewrite, no classifier call, no
@@ -38,6 +40,22 @@ The shipped default (manifest `config_schema`, example config, and the
 code-level default in `_load_config()`) is `mode: shadow`. In shadow mode the
 plugin decides and logs but NEVER rewrites a request. Going live is an
 explicit human action: edit the config and set `"mode": "live"`.
+
+## No egress without a ladder (v1.0.12)
+
+Classification sends turn shape features and (by default) a capped excerpt of
+the last user message to the vendor classifier. If **no rung resolves** for a
+provider — no `lane2_config.json`, or the config names no free/flash/mid/premium
+rung for it — there is nothing to route to, so the plugin skips the classifier
+entirely and logs `no_rungs_configured`: **no vendor call, no excerpt leaves the
+box**. Classification only ever happens on an install that has a ladder.
+
+## Error auto-switch (v1.0.12)
+
+A 401, 404 or 429 from a rung the router chose arms the next live rung for that
+session (30-minute TTL, LRU-bounded); the next request is served there and the
+turn is never stopped. The top rung and non-router statuses are no-ops, and a
+shadow-mode install arms the same override (it is not a rewrite).
 
 ## Credit probe: fail-CLOSED (escalation direction only)
 

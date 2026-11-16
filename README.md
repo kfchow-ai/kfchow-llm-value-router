@@ -25,8 +25,7 @@ keep the routed model instead of silently reverting. The plugin:
 
 1. checks eligibility — only providers you list in the config are ever
    touched (whatever default model you run, see *Source-agnostic ladder*
-   below), a turn already on a free-tier model is never re-routed, and a turn
-   is never "moved" onto the model it is already on;
+   below), and a turn is never "moved" onto the model it is already on;
 2. asks a vendor classifier (TypeSafe "Jev", a 3–10s bounded call) which pool
    the turn belongs to (routine vs strong) and how confident it is;
 3. in `shadow` mode (default): records the decision and leaves the request
@@ -75,12 +74,34 @@ rung. Eligibility is **provider match only**; `source_mode` narrows it:
 An unrecognised value falls back to `"allowlist"` (the conservative side: it
 touches fewer turns, never more) and logs one warning per distinct value.
 
-Guards that hold in every mode: a source already on a free model (`:free`,
-`free`, `space-bunny`) is never rewritten (logged `already_free_tier`); a
-paid-pool verdict below the escalation gate never downgrades; and a turn is
-never moved onto the model it is already on — a premium-default turn with a
-strong-model verdict stays put (logged `already_on_target`, no credit probe
-spent), as does a flash-default turn inside the flash band.
+Guards that hold in every mode: a turn already on a free model is **never
+rewritten downward** (nothing below the free rung exists) — logged
+`already_free_tier`; a paid-pool verdict below the escalation gate never
+downgrades; and a turn is never moved onto the model it is already on — a
+premium-default turn with a strong-model verdict stays put (logged
+`already_on_target`, no credit probe spent), as does a flash-default turn
+inside the flash band.
+
+**Free is the default rung (v1.0.12).** A turn that starts on the provider's
+free rung is *classified*, not skipped, so a hard verdict can route it **up**
+the ladder: free pool 0.35–0.65 → flash, 0.65–0.80 → mid, paid ≥ 0.80 →
+premium (credit-probed). An easy verdict holds on the free rung and is never
+moved. Route-up is one-way — the free rung is the floor, never a target from a
+free source. A paid-pool verdict below the escalation gate still stays put
+(D7). Set `free_default_route_up: false` to restore the pre-v1.0.12
+skip-before-classify behaviour.
+
+**401/404/429 auto-switch (v1.0.12).** If a request on a rung the router chose
+fails with 401, 404 or 429, the plugin arms the *next live rung* for that
+session (30-minute TTL, LRU-bounded) and serves the next request there, so the
+turn is never stopped by a dead free-tier id or a capacity error. The top
+rung and non-router statuses are no-ops. Verified against the live ladder:
+free 429 → flash, flash 401 → mid, premium 429 → no override.
+
+**No egress without a configured rung (v1.0.12).** If no rung resolves for a
+provider, the plugin skips the classifier entirely — **no vendor call and no
+excerpt is sent** — and logs `no_rungs_configured`. Classification only ever
+happens on an install that has a ladder to route to.
 
 ## Per-request kill switch (`X-KFC-Router`, v1.0.8)
 
