@@ -188,6 +188,14 @@ _DECISIONS_LOCK = threading.Lock()
 _DECISIONS_MAX = 256                  # evict oldest (LRU)
 _DECISIONS_TTL_S = 3600               # expiry; expired => behave as unknown (fail-open)
 
+# Per-SESSION model override armed by the api_request_error hook (v1.0.12).
+# A 401/404/429 from the free rung must not stop the turn: the hook picks the
+# next live rung and the next request in this session is served there.
+_SESSION_OVERRIDE = OrderedDict()    # "session_id" -> {"model": ..., "ts": ...}
+_SESSION_OVERRIDE_LOCK = threading.Lock()
+_SESSION_OVERRIDE_TTL_S = 1800       # 30 min; a stale override must not stick
+_ERROR_RUNGS = ("free", "flash", "mid", "premium")
+
 # Resolved lazily; the vendored client lives in the plugin's own scripts/ dir.
 _JC = None
 
@@ -497,6 +505,75 @@ def _classify(features, cfg):
         return None, None
 
 
+def _session_override(session_id):
+    """Armed override for this session, or None (expired/absent)."""
+    if not session_id:
+        return None
+    with _SESSION_OVERRIDE_LOCK:
+        ent = _SESSION_OVERRIDE.get(session_id)
+        if not ent:
+            return None
+        if time.monotonic() - ent["ts"] > _SESSION_OVERRIDE_TTL_S:
+            _SESSION_OVERRIDE.pop(session_id, None)
+            return None
+        _SESSION_OVERRIDE.move_to_end(session_id)
+        return ent["model"]
+
+
+def on_api_request_error(**kwargs):
+    """api_request_error hook (v1.0.12): never stop the turn on a 401/404/429.
+
+    The host already retries 429s and rotates 401s, but neither moves the
+    request off a rung that the router itself chose. If the failing model is
+    one of OUR rungs, arm the next live rung for this session so the next
+    request is served there. Shadow mode still arms the override (it is not a
+    rewrite), so the choice is visible in the log.
+    """
+    try:
+        status = kwargs.get("status_code")
+        if status not in (401, 404, 429):
+            return
+        request = ((kwargs.get("api_kwargs") or {}).get("body")) or {}
+        model = str(request.get("model") or "")
+        provider = str(kwargs.get("provider") or "")
+        if not model:
+            return
+        cfg = _load_config()
+        rung_models = {k: _rung(cfg, provider, k, k + "_model") for k in _ERROR_RUNGS}
+        # Which rung failed? Match by id, else fall back to "below free".
+        idx = 0
+        for i, k in enumerate(_ERROR_RUNGS):
+            if _same_model(rung_models[k], model):
+                idx = i
+                break
+        # Next live rung above the failed one, skipping empty slots.
+        nxt = None
+        for k in _ERROR_RUNGS[idx + 1:]:
+            if rung_models[k]:
+                nxt = rung_models[k]
+                break
+        if not nxt or _same_model(nxt, model):
+            return
+        session_id = str(kwargs.get("session_id") or "")
+        if not session_id:
+            return
+        with _SESSION_OVERRIDE_LOCK:
+            _SESSION_OVERRIDE[session_id] = {"model": nxt, "ts": time.monotonic()}
+            _SESSION_OVERRIDE.move_to_end(session_id)
+            while len(_SESSION_OVERRIDE) > _DECISIONS_MAX:
+                _SESSION_OVERRIDE.popitem(last=False)
+        _log({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+              "turn_id": str(kwargs.get("turn_id") or ""), "session_id": session_id,
+              "provider": provider, "model": model, "pool": None,
+              "confidence": None, "gate": None, "eligible": False,
+              "mode": str(cfg.get("mode", "shadow")).lower(),
+              "applied": False, "skip_reason": "error_override_armed",
+              "error_status": status, "error_reason": str(kwargs.get("reason") or ""),
+              "override_target": nxt})
+    except Exception:
+        pass
+
+
 def on_llm_request(**kwargs):
     """llm_request middleware. Returns {'request': {...}} to rewrite, else None."""
     try:
@@ -531,6 +608,20 @@ def on_llm_request(**kwargs):
         # path too), because a flag can appear on any call of the turn.
         if _kill_switch_off(request):
             return _skip("disabled_by_request")
+
+        # ---- SESSION ERROR OVERRIDE (v1.0.12) ------------------------------
+        # Armed by on_api_request_error after a 401/404/429 from a rung we
+        # chose. Wins over the decision cache: the turn must not stop, and the
+        # next request is served on the next live rung.
+        forced = _session_override(session_id)
+        if forced and not _same_model(forced, model):
+            _log({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "turn_id": turn_id,
+                  "session_id": session_id, "provider": provider, "model": model,
+                  "pool": None, "confidence": None, "gate": None, "eligible": False,
+                  "mode": str(cfg.get("mode", "shadow")).lower(),
+                  "applied": str(cfg.get("mode", "shadow")).lower() == "live",
+                  "skip_reason": "error_override_applied", "override_target": forced})
+            return {"request": {"model": forced}}
 
         # ---- TURN DECISION CACHE (P1) ------------------------------------
         # The host re-runs this middleware on every attempt of the turn
@@ -1102,3 +1193,9 @@ def register(ctx):
     _PLUGIN_CTX = ctx  # panel-wired switch (v1.0.9): see _PANEL_KEYS
     ctx.register_middleware("llm_request", on_llm_request)
     ctx.register_middleware("llm_execution", on_llm_execution)
+    try:
+        ctx.register_hook("api_request_error", on_api_request_error)
+    except Exception:
+        # host without the error hook: routing still works, only the
+        # 401/404/429 auto-switch is unavailable.
+        pass

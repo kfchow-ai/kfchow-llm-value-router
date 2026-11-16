@@ -53,6 +53,8 @@ def _reset_decisions():
     """Clear the module-level turn-decision cache so tests start from empty state."""
     with pl._DECISIONS_LOCK:
         pl._DECISIONS.clear()
+    with pl._SESSION_OVERRIDE_LOCK:
+        pl._SESSION_OVERRIDE.clear()
 
 
 # --------------------------------------------------------------- escalation
@@ -633,6 +635,69 @@ def test_free_default_route_up_paid_mid_band_does_not_downgrade(monkeypatch):
     out, row, probes, classified = _run7(monkeypatch, _LING, "paid", 0.50, "l8-paid50")
     assert out is None and row["skip_reason"] == "already_free_tier"
     assert classified == [1] and probes == []
+
+
+# ------------------------------------------------- error hook (v1.0.12)
+
+def _err_kwargs(model, status, session="s1", reason="rate_limit"):
+    return {"status_code": status, "reason": reason, "session_id": session,
+            "turn_id": "e1", "provider": "nous",
+            "api_kwargs": {"body": {"model": model, "messages": []}}}
+
+
+@pytest.mark.parametrize("status", [401, 404, 429])
+def test_error_hook_arms_next_live_rung(monkeypatch, status):
+    # A 401/404/429 from the free rung arms the NEXT rung for the session;
+    # the turn must not stop.
+    recs = []
+    monkeypatch.setattr(pl, "_load_config", lambda: _cfg7())
+    monkeypatch.setattr(pl, "_log", recs.append)
+    _reset_decisions()
+    pl.on_api_request_error(**_err_kwargs(_LING, status))
+    assert pl._session_override("s1") == _FLASH
+    assert recs[-1]["skip_reason"] == "error_override_armed"
+    assert recs[-1]["error_status"] == status
+
+
+def test_error_hook_non_router_status_is_noop(monkeypatch):
+    monkeypatch.setattr(pl, "_load_config", lambda: _cfg7())
+    monkeypatch.setattr(pl, "_log", lambda rec: None)
+    _reset_decisions()
+    pl.on_api_request_error(**_err_kwargs(_LING, 500))
+    assert pl._session_override("s1") is None
+
+
+def test_error_hook_skips_empty_rungs(monkeypatch):
+    # flash/mid empty -> the override jumps to the next live rung (premium).
+    monkeypatch.setattr(pl, "_load_config", lambda: _cfg7(flash_model="", mid_model=""))
+    monkeypatch.setattr(pl, "_log", lambda rec: None)
+    _reset_decisions()
+    pl.on_api_request_error(**_err_kwargs(_LING, 429))
+    assert pl._session_override("s1") == _cfg7()["premium_model"]
+
+
+def test_error_override_rewrites_next_request(monkeypatch):
+    recs = []
+    monkeypatch.setattr(pl, "_load_config", lambda: _cfg7())
+    monkeypatch.setattr(pl, "_log", recs.append)
+    _reset_decisions()
+    pl.on_api_request_error(**_err_kwargs(_LING, 429))
+    out = pl.on_llm_request(**_kwargs(model=_LING, turn_id="after-err"))
+    assert out == {"request": {"model": _FLASH}}
+    assert recs[-1]["skip_reason"] == "error_override_applied"
+    assert recs[-1]["applied"] is True          # live mode
+
+
+def test_error_override_expires(monkeypatch):
+    import time as _t
+    monkeypatch.setattr(pl, "_load_config", lambda: _cfg7())
+    monkeypatch.setattr(pl, "_log", lambda rec: None)
+    _reset_decisions()
+    pl.on_api_request_error(**_err_kwargs(_LING, 429))
+    assert pl._session_override("s1") == _FLASH
+    with pl._SESSION_OVERRIDE_LOCK:
+        pl._SESSION_OVERRIDE["s1"]["ts"] -= pl._SESSION_OVERRIDE_TTL_S + 1
+    assert pl._session_override("s1") is None
 
 
 def test_no_rungs_configured_skips_classifier_and_excerpt(monkeypatch):
