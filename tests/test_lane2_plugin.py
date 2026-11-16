@@ -629,12 +629,20 @@ def test_allowlist_mode_restores_v106_semantics(monkeypatch):
     out, _, _, _ = _run7(monkeypatch, _FLASH, "free", 0.99, "a7-2",
                          source_mode="allowlist")
     assert out is not None and out["request"]["model"] == _LING
-    # listed mid default (escalate_models): escalates, and flash band applies
+    # listed mid default (escalate_models): escalates
     out, _, _, _ = _run7(monkeypatch, "z-ai/glm-5.3", "paid", 0.90, "a7-3",
                          source_mode="allowlist")
     assert out is not None and out["request"]["model"] == _SONNET
-    out, _, _, _ = _run7(monkeypatch, "z-ai/glm-5.3", "free", 0.50, "a7-4",
-                         source_mode="allowlist")
+    # DOWN-moves additionally require route-lane eligibility: the deployed bands
+    # are gated on `free_src` (v1.0.11 tightened routing scope), so a mid default
+    # listed only in escalate_models stays put instead of dropping to flash.
+    out, row, _, _ = _run7(monkeypatch, "z-ai/glm-5.3", "free", 0.50, "a7-4",
+                           source_mode="allowlist")
+    assert row is not None and row["skip_reason"] == "below_gate"
+    # ...and once it IS listed for routing too, the flash band applies.
+    out, _, _, _ = _run7(monkeypatch, "z-ai/glm-5.3", "free", 0.50, "a7-5",
+                         source_mode="allowlist",
+                         route_models=["z-ai/glm-5.3", "glm-5.3"])
     assert out is not None and out["request"]["model"] == _FLASH
 
 
@@ -759,11 +767,15 @@ def _expect_free_pool(source, conf):
 
 
 def _expect_paid_pool(source, conf):
-    """(wire model or None, skip_reason) for a PAID-pool verdict (esc gate 0.80)."""
+    """(wire model or None, skip_reason) for a PAID-pool verdict (esc gate 0.80).
+
+    D7 (Marc 2026-11-03): the routine band is FREE-POOL ONLY by default, so every
+    paid-pool verdict below the escalation gate stays on its source model
+    (`pool_paid`). The v1.0.10 pool-agnostic behaviour is opt-in via
+    `paid_pool_routine_band: true` (covered by its own test).
+    """
     if conf >= 0.80:
         return (None, "already_on_target") if source == _SONNET else (_SONNET, None)
-    if conf < 0.35:
-        return _LING, None    # v1.0.10: the low band is pool-agnostic
     return None, "pool_paid"
 
 
@@ -806,15 +818,37 @@ def _next7(seen):
     return _n
 
 
-def test_routine_band_default_and_paid_pool_both_go_free(monkeypatch):
-    # v1.0.10: conf below the flash gate rides the free rung, ANY pool/source.
-    for i, (pool, src) in enumerate((("free", _SONNET), ("paid", _SONNET),
-                                     ("free", _GPT), ("paid", _FLASH))):
-        out, row, probes, _ = _run7(monkeypatch, src, pool, 0.20,
-                                    "r7-low-%d" % i)
+def test_routine_band_free_pool_rides_free_paid_pool_stays(monkeypatch):
+    """D7 (Marc 2026-11-03): the routine band is free-pool only by default.
+
+    Free-pool turns below the flash gate ride the free rung from any source;
+    paid-pool turns stay on their source model (no downgrade) unless the
+    operator opts back into the v1.0.10 pool-agnostic behaviour.
+    """
+    for i, src in enumerate((_SONNET, _GPT)):
+        out, row, probes, _ = _run7(monkeypatch, src, "free", 0.20,
+                                    "r7-low-f%d" % i)
+        assert row is not None and row["tier"] == "free" and row["applied"] is True
         assert out is not None and out["request"]["model"] == _LING
         assert "routine band" in out["reason"]
-        assert row["tier"] == "free" and row["applied"] is True
+        assert probes == []
+    for i, src in enumerate((_SONNET, _FLASH)):
+        out, row, probes, _ = _run7(monkeypatch, src, "paid", 0.20,
+                                    "r7-low-p%d" % i)
+        assert row is not None and row["skip_reason"] == "pool_paid"
+        assert row["tier"] == "stay" and row["applied"] is False
+        assert out is None and probes == []
+
+
+def test_routine_band_paid_pool_opt_in_restores_v1010_behaviour(monkeypatch):
+    """`paid_pool_routine_band: true` restores the v1.0.10 pool-agnostic band."""
+    for i, src in enumerate((_SONNET, _FLASH)):
+        out, row, probes, _ = _run7(monkeypatch, src, "paid", 0.20,
+                                    "r7-low-opt%d" % i,
+                                    paid_pool_routine_band=True)
+        assert row is not None and row["tier"] == "free" and row["applied"] is True
+        assert out is not None and out["request"]["model"] == _LING
+        assert "routine band" in out["reason"]
         assert probes == []
 
 
