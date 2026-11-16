@@ -140,7 +140,10 @@ POOL_CRITERIA = {
 }
 
 # A turn already on a free/trial model must never be "routed" again.
-_FREE_HINTS = (":free", "free", "space-bunny")
+# v1.0.11 (2026-11-12): dropped the "space-bunny" hint — that model retired
+# (400 "Model is unavailable"). "free" already matches every free id on both
+# lanes (":free" contains "free"; Go's longcat-2.5-free carries the suffix).
+_FREE_HINTS = (":free", "free")
 
 # PER-REQUEST KILL SWITCH (v1.0.8). A client can disable routing for its own
 # request with NO config edit and zero blast radius on other turns. The flag
@@ -157,7 +160,7 @@ KILL_SWITCH_OFF_VALUES = ("off", "0", "false", "disable", "disabled")
 # 402). A gate that escalates to premium without checking would have turned
 # that outage into failed turns. Fail-CLOSED: an unknown probe outcome means
 # do not escalate — the turn keeps the affordable rung.
-CREDIT_PROBE_MODEL = "z-ai/glm-5.3-flash"
+CREDIT_PROBE_MODEL = "anthropic/claude-haiku-5.5"
 CREDIT_TTL_S = 300          # don't probe on every turn
 _CREDIT = {"ok": None, "checked_at": 0.0, "identity": None}
 _CREDIT_LOCK = threading.Lock()
@@ -536,10 +539,18 @@ def on_llm_request(**kwargs):
                 _DECISIONS.move_to_end(key)
 
         if known is not None:
-            # Established decision: never classify again, never recompute
-            # eligibility, and NEVER route across providers.
+            # Established decision: never classify again, and NEVER route
+            # across providers. Provider eligibility IS re-checked on every
+            # call: a scope change (a provider removed from route_providers)
+            # must take effect on the NEXT call of an in-flight turn, not
+            # whenever its cached decision happens to expire.
             if provider != known["provider"]:
                 return None
+            if known["decision"] in ("free", "mid", "flash", "paid"):
+                f_src, e_src = _source_eligibility(cfg, provider, model)
+                lane_ok = e_src if known["decision"] == "paid" else f_src
+                if not lane_ok:
+                    return _skip("provider_not_eligible")
             if str(cfg.get("mode", "shadow")).lower() != "live":
                 return None  # shadow: follow-ups never rewritten, no extra rows
             decision = known["decision"]
@@ -662,7 +673,7 @@ def on_llm_request(**kwargs):
         except (TypeError, ValueError):
             flash_gate = DEFAULT_FLASH_GATE
         flash_model = _rung(cfg, provider, "flash", "flash_model")
-        flash_band = (pool == "free" and confidence is not None
+        flash_band = (free_src and pool == "free" and confidence is not None
                       and flash_gate <= float(confidence) < gate
                       and bool(flash_model))
         # v1.0.7 identity guard: a turn is never "moved" onto the model it is
@@ -720,11 +731,18 @@ def on_llm_request(**kwargs):
         if isinstance(mid_model, list):
             mid_model = mid_model[0] if mid_model else None
         conf_f = float(confidence) if confidence is not None else None
-        free_hi_band = (pool == "free" and conf_f is not None
+        free_hi_band = (free_src and pool == "free" and conf_f is not None
                         and conf_f >= esc_gate and bool(free_model))
-        mid_band = (pool == "free" and conf_f is not None
+        mid_band = (free_src and pool == "free" and conf_f is not None
                     and gate <= conf_f < esc_gate and bool(mid_model))
-        free_low_band = (conf_f is not None and conf_f < flash_gate
+        # D7 (Marc 2026-11-03): the routine band is FREE-POOL ONLY by default.
+        # A paid-pool verdict below flash_gate stays on its SOURCE model
+        # instead of being downgraded to the free rung. The v1.0.10
+        # pool-agnostic behaviour is opt-in via "paid_pool_routine_band": true.
+        free_low_band = (free_src and conf_f is not None
+                         and conf_f < flash_gate
+                         and (pool == "free"
+                              or bool(cfg.get("paid_pool_routine_band", False)))
                          and bool(free_model))
         eligible = (free_hi_band or free_low_band) and \
             not _same_model(free_model, model)
@@ -902,6 +920,18 @@ def on_llm_execution(request=None, next_call=None, **context):
 
         decision = known["decision"]
         target = known.get("target")
+        # Re-check provider eligibility on every cached replay (same rule as
+        # on_llm_request): a scope change must take effect on the next call.
+        if decision in ("free", "mid", "flash", "paid"):
+            f_src, e_src = _source_eligibility(cfg, provider, model)
+            lane_ok = e_src if decision == "paid" else f_src
+            if not lane_ok:
+                _log({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                      "turn_id": turn_id, "session_id": session_id,
+                      "provider": provider, "model": model,
+                      "applied": False, "skip_reason": "provider_not_eligible",
+                      "tier": decision})
+                return _dispatch(request)
 
         if decision == "free":
             if not target:  # defensive: never rewrite to ''
