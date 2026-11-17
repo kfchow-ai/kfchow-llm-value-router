@@ -191,7 +191,7 @@ _DECISIONS_TTL_S = 3600               # expiry; expired => behave as unknown (fa
 # Per-SESSION model override armed by the api_request_error hook (v1.0.12).
 # A 401/404/429 from the free rung must not stop the turn: the hook picks the
 # next live rung and the next request in this session is served there.
-_SESSION_OVERRIDE = OrderedDict()    # "session_id" -> {"model": ..., "ts": ...}
+_SESSION_OVERRIDE = OrderedDict()    # "session_id" -> {"model": ..., "provider": ..., "ts": ...}
 _SESSION_OVERRIDE_LOCK = threading.Lock()
 _SESSION_OVERRIDE_TTL_S = 1800       # 30 min; a stale override must not stick
 _ERROR_RUNGS = ("free", "flash", "mid", "premium")
@@ -463,12 +463,11 @@ def _log(rec):
                 logger.warning("routing log failed for %s (%s; failures: %d)",
                                LOG_PATH, type(exc).__name__, failures)
             except Exception:
-                pass  # a broken logging handler must not block the stderr fallback
-            try:
-                print("routing log failed for %s (%s; failures: %d)"
-                      % (LOG_PATH, type(exc).__name__, failures), file=sys.stderr)
-            except Exception:
-                pass  # stderr may also be unavailable; never break the turn
+                try:
+                    print("routing log failed for %s (%s; failures: %d)"
+                          % (LOG_PATH, type(exc).__name__, failures), file=sys.stderr)
+                except Exception:
+                    pass  # stderr may also be unavailable; never break the turn
 
 
 def _features(request, excerpt_chars=1200, include_excerpt=True):
@@ -540,7 +539,7 @@ def _classify(features, cfg):
         return None, None
 
 
-def _session_override(session_id):
+def _session_override(session_id, provider=None):
     """Armed override for this session, or None (expired/absent)."""
     if not session_id:
         return None
@@ -550,6 +549,8 @@ def _session_override(session_id):
             return None
         if time.monotonic() - ent["ts"] > _SESSION_OVERRIDE_TTL_S:
             _SESSION_OVERRIDE.pop(session_id, None)
+            return None
+        if provider is not None and (not provider or ent.get("provider") != provider):
             return None
         _SESSION_OVERRIDE.move_to_end(session_id)
         return ent["model"]
@@ -595,7 +596,8 @@ def on_api_request_error(**kwargs):
         if not session_id:
             return
         with _SESSION_OVERRIDE_LOCK:
-            _SESSION_OVERRIDE[session_id] = {"model": nxt, "ts": time.monotonic()}
+            _SESSION_OVERRIDE[session_id] = {"model": nxt, "provider": provider,
+                                             "ts": time.monotonic()}
             _SESSION_OVERRIDE.move_to_end(session_id)
             while len(_SESSION_OVERRIDE) > _DECISIONS_MAX:
                 _SESSION_OVERRIDE.popitem(last=False)
@@ -650,9 +652,10 @@ def on_llm_request(**kwargs):
         # Armed by on_api_request_error after a 401/404/429 from a rung we
         # chose. Wins over the decision cache: the turn must not stop, and the
         # next request is served on the next live rung.
-        forced = _session_override(session_id)
-        if (forced and str(cfg.get("mode", "shadow")).lower() == "live"
-                and not _same_model(forced, model)):
+        forced = _session_override(session_id, provider)
+        if forced and str(cfg.get("mode", "shadow")).lower() == "live":
+            if request.get("model") == forced:
+                return None  # already effective; never reapply the cached decision
             _log({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "turn_id": turn_id,
                   "session_id": session_id, "provider": provider, "model": model,
                   "pool": None, "confidence": None, "gate": None, "eligible": False,
@@ -1084,6 +1087,20 @@ def on_llm_execution(request=None, next_call=None, **context):
         session_id = str(context.get("session_id") or "")
         api_call_count = context.get("api_call_count")
         mode = str(cfg.get("mode", "shadow")).lower()
+
+        # Error recovery wins over the cached turn decision on every call.
+        forced = _session_override(session_id, provider)
+        if forced and mode == "live":
+            if not isinstance(request, dict) or req.get("model") == forced:
+                return _dispatch(request)
+            previous_model = req.get("model")
+            req["model"] = forced
+            _log({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                  "turn_id": turn_id, "session_id": session_id,
+                  "provider": provider, "model": previous_model,
+                  "applied": True, "reapply": True,
+                  "skip_reason": "error_override_applied", "override_target": forced})
+            return _dispatch(req)
 
         # Same store, same key, same eviction policy as on_llm_request.
         key = f"{session_id}:{turn_id}"
