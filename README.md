@@ -141,12 +141,20 @@ re-application of an earlier decision — the rewrite cannot reappear mid-turn.
 - **A rewrite never crosses providers**: rungs resolve per provider.
 - **Local-only telemetry**: decision logs go to `~/.hermes/jev/lane2-live.jsonl`
   (0600), nothing is uploaded.
-- **`send_excerpt` toggle**: the classifier is sent turn shape features
-  (counts, flags) plus, by default, a capped 1200-char excerpt of the last
-  user message — this is load-bearing (shape-only scoring mislabels hard
-  questions, measured 0.31 vs 1.00 accuracy). Set `"send_excerpt": false` in
-  the config to keep task text out of BOTH the vendor call and the log;
-  expect reduced routing accuracy.
+- **`send_excerpt` toggle**: the classifier receives shape features (counts and
+  flags) by default, not prompt text. Set `"send_excerpt": true` to opt in to
+  sending a capped excerpt (default 1200 characters) to the vendor and local
+  log. Shape-only classification may reduce routing accuracy; this is the
+  intended privacy trade-off. Existing explicit settings remain in effect.
+- **Classifier spend**: set `"classifier_spend_cap_usd"` in
+  `lane2_config.json` (default $0.01 per session; zero disables classifier
+  calls). Cost is known only after a response, so one call may exceed the cap.
+  Reaching it, a missing session, or an unavailable ledger skips classification
+  and keeps the current model. A timeout or unknown cost blocks subsequent
+  classifier calls for that session. The local decision log records Jev-only
+  `classifier_cost_usd` and `classifier_usage`; it does not record subscription
+  provider costs or token consumption. `excerpt_sent` is `true`, `false`, or
+  `null` when delivery cannot be determined.
 - **Optional keys, never forced**: `JEVI_API_KEY` (vendor classifier) and
   `NOUS_API_KEY` (credit probe) are optional environment variables. Without
   them the plugin degrades safely — without the Jev key it routes nothing

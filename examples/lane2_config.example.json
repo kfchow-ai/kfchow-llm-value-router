@@ -28,8 +28,9 @@
   "premium_model": "",
   "escalate_confidence_gate": 0.8,
   "credit_probe": true,
-  "send_excerpt": true,
+  "send_excerpt": false,
   "excerpt_chars": 1200,
+  "classifier_spend_cap_usd": 0.01,
   "jev_timeout_s": 10,
   "rungs": {
     "nous": {

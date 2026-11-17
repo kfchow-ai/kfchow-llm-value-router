@@ -43,9 +43,10 @@ explicit human action: edit the config and set `"mode": "live"`.
 
 ## No egress without a ladder (v1.0.12)
 
-Classification sends turn shape features and (by default) a capped excerpt of
-the last user message to the vendor classifier. If **no rung resolves** for a
-provider — no `lane2_config.json`, or the config names no free/flash/mid/premium
+Classification sends turn shape features to the vendor classifier. A capped
+excerpt of the last message is sent only with explicit `send_excerpt: true`.
+If **no rung resolves** for a provider — no `lane2_config.json`, or the config
+names no free/flash/mid/premium
 rung for it — there is nothing to route to, so the plugin skips the classifier
 entirely and logs `no_rungs_configured`: **no vendor call, no excerpt leaves the
 box**. Classification only ever happens on an install that has a ladder.
@@ -83,7 +84,7 @@ file itself.
 
 | Call | When | What is sent | Key |
 |------|------|--------------|-----|
-| `POST https://api.typesafe.ai/v1/systemone` | first provider call of an eligible turn (every turn when routing is enabled) | turn shape features (message/tool counts, char counts, boolean flags) + the capped last-user-message excerpt when `send_excerpt: true` | `JEVI_API_KEY` (env first, then 0600 creds file fallback) |
+| `POST https://api.typesafe.ai/v1/systemone` | first provider call of an eligible turn (every turn when routing is enabled) | turn shape features (message/tool counts, char counts, boolean flags) + the capped last-message excerpt when `send_excerpt: true` | `JEVI_API_KEY` (env first, then 0600 creds file fallback) |
 | `POST <nous>/v1/chat/completions` with a 2-token ping | escalation candidate on a metered provider, at most every 5 minutes | the literal string `"ping"` | `NOUS_API_KEY` (env only) |
 | `GET https://kfchow.com/llm-value-leaderboard/feed.xml` | when YOU run `scripts/llm-rank-resolver.py` (or a schedule you set up) | nothing (public feed fetch) | none |
 
@@ -102,21 +103,20 @@ No telemetry, no analytics, no phone-home beyond the calls above.
 
 - `~/.hermes/jev/lane2-live.jsonl` — one JSON decision row per eligible turn
   (permissions 0600). May contain the task excerpt when `send_excerpt: true`.
+- `~/.hermes/jev/classifier-spend.sqlite3` — private (0600) per-session
+  classifier spend ledger; stores hashed session IDs and spend, not prompts.
+  Concurrent calls in a session are serialized, and a missing/unknown charge
+  leaves that session blocked from further classifier calls.
 - `~/.hermes/jev/llm_rungs.json` — written by `scripts/llm-rank-resolver.py`
   when you run it (not by the middleware).
 
 ## Privacy toggle: `send_excerpt`
 
-Default `true` because the excerpt is load-bearing: measured on real traffic,
-shape-only classification mislabels hard questions as free (0.31 free /
-0.23 paid) and adding a capped last-user-message excerpt moved the same turns
-to 1.00/1.00. Setting `send_excerpt: false`:
-
-- omits `task_excerpt` from the vendor request (shape-only state is sent), AND
-- omits it from the local log row.
-
-Accuracy drops — expect more turns to stay on the paid/mid rung — but no task
-text ever leaves the machine or reaches the log file.
+Default `false`: task text is omitted from the vendor request and local log;
+shape features still leave the host. Shape-only classification may reduce
+routing accuracy, the intended privacy trade-off. Set `send_excerpt: true` to
+opt in to sending a capped excerpt and including it in the log. An existing
+explicit `true` setting remains effective and must be changed to opt out.
 
 ## What it never does
 

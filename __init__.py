@@ -80,9 +80,9 @@ SAFETY CONTRACT (every one of these is enforced in code, not convention)
       error from downstream (the provider/next middleware) propagates after
       having been invoked, and a next_call that was never invoked is handed
       the untouched request, never swallowed.
-    * Telemetry: decision logs are written to a local JSONL file only. Set
-      `send_excerpt: false` to keep task text out of the vendor call AND the
-      log (shape-only features still classify, with reduced accuracy).
+    * Telemetry: decision logs are written to a local JSONL file only. Task
+      text is excluded from vendor calls and logs unless `send_excerpt: true`
+      explicitly opts in (shape-only classification may be less accurate).
 
 Config: ~/.hermes/jev/lane2_config.json       Log: ~/.hermes/jev/lane2-live.jsonl
 """
@@ -90,19 +90,25 @@ Config: ~/.hermes/jev/lane2_config.json       Log: ~/.hermes/jev/lane2-live.json
 import hashlib
 import json
 import logging
+import math
 import os
 import re
+import sqlite3
+import stat
 import sys
 import threading
 import time
 import urllib.request
 from collections import OrderedDict
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
 
 logger = logging.getLogger(__name__)
 
 _HERMES_HOME = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
 CONFIG_PATH = os.path.join(_HERMES_HOME, "jev", "lane2_config.json")
 LOG_PATH = os.path.join(_HERMES_HOME, "jev", "lane2-live.jsonl")
+CLASSIFIER_BUDGET_PATH = os.path.join(_HERMES_HOME, "jev", "classifier-spend.sqlite3")
+DEFAULT_CLASSIFIER_SPEND_CAP_USD = 0.01
 ROUTING_QUESTION_ID = "routing_tier"
 JEV_TIMEOUT_S = 10          # keep well under a turn's own latency budget
 DEFAULT_GATE = 0.80
@@ -283,8 +289,9 @@ def _load_config():
            "premium_model": "",
            "escalate_confidence_gate": None,   # falls back to DEFAULT_GATE (0.80)
            "credit_probe": True,
-           "send_excerpt": True,
+           "send_excerpt": False,
            "excerpt_chars": DEFAULT_EXCERPT_CHARS,
+           "classifier_spend_cap_usd": DEFAULT_CLASSIFIER_SPEND_CAP_USD,
            # PER-PROVIDER RUNGS. A rewrite must NEVER cross providers: the
            # request's base_url/api_key belong to the originating provider, so
            # swapping only the model id would send the wrong id to the wrong
@@ -457,21 +464,13 @@ def _log(rec):
                            LOG_PATH, type(exc).__name__, failures)
 
 
-def _features(request, excerpt_chars=1200, include_excerpt=True):
+def _features(request, excerpt_chars=1200, include_excerpt=False):
     """Features of the outgoing request.
 
-    By default INCLUDES a task excerpt (the last user message, capped). This is
-    load-bearing, not decoration: measured on real traffic, a SHAPE-ONLY state
-    cannot tell strategy from routine — a hard architecture question scored
-    free 0.31/paid 0.23 on shape alone, because "2 messages, 27 tools, 5403
-    chars" carries no meaning. Adding the excerpt moved the same turn to paid
-    1.00 and a routine turn to free 1.00.
-
-    The excerpt sends task text to the Jev vendor. Operators who prefer not to
-    share task text set `send_excerpt: false` in the config: the excerpt is
-    then omitted from BOTH the vendor call and the local log row (shape-only
-    features still reach the classifier, with reduced accuracy).
-    Excerpt is capped and only the LAST user message is used.
+    The routing path excludes task text by default; operators may explicitly
+    set `send_excerpt: true` to send a capped excerpt of the last message to
+    the vendor and include it in the local log. Shape-only scoring may reduce
+    accuracy, because message/tool counts carry no task meaning.
     """
     msgs = request.get("messages") or request.get("input") or []
     n_msgs = len(msgs) if isinstance(msgs, list) else 0
@@ -496,34 +495,103 @@ def _features(request, excerpt_chars=1200, include_excerpt=True):
         "is_question": text.strip().endswith("?"),
     }
     if include_excerpt:
-        feats["task_excerpt"] = text[:excerpt_chars]
+        feats["task_excerpt"] = text[:max(0, excerpt_chars)]
     return feats
 
 
-def _classify(features, cfg):
-    """Ask Jev. Returns (pool, confidence) or (None, None) on ANY failure."""
+def _classify(features, cfg, telemetry=None):
+    """Ask Jev. Return (pool, confidence), recording only classifier telemetry."""
+    telemetry = telemetry if telemetry is not None else {}
+    include_excerpt = cfg.get("send_excerpt") is True
+    task = features.get("task_excerpt", "") if include_excerpt else ""
+    telemetry.update(excerpt_sent=False, classifier_cost_usd=None, classifier_usage=None)
     try:
         jc = _vendored_client()
-        include_excerpt = bool(cfg.get("send_excerpt", True))
         feats = {k: v for k, v in features.items() if k != "task_excerpt"}
-        task = features.get("task_excerpt", "") if include_excerpt else ""
-        if not include_excerpt:
-            # Strip the excerpt entirely so it reaches neither the vendor call
-            # nor the log row recorded from these features.
-            features = feats
-        state = {"turn_features": feats,
-                 "task": task,
+        state = {"turn_features": feats, "task": task,
                  "context": "live agent turn; choose the cheapest ADEQUATE pool"}
         questions = {ROUTING_QUESTION_ID: {
             "type": "choice", "criteria": dict(POOL_CRITERIA)}}
-        # Bound the call: a slow vendor must not stall the user's turn.
+        # A timeout after dispatch cannot prove whether text reached the vendor.
         timeout = float(cfg.get("jev_timeout_s", JEV_TIMEOUT_S))
+        telemetry["excerpt_sent"] = None if task else False
         result = jc.evaluate(state, questions, timeout=timeout, retries=0)
+        telemetry["excerpt_sent"] = bool(task)
+        telemetry["classifier_cost_usd"] = result.get("cost_usd")
+        usage = result.get("usage")
+        if isinstance(usage, dict):
+            telemetry["classifier_usage"] = {k: usage.get(k) for k in
+                                               ("input_tokens", "output_tokens")}
         ans = (result.get("answers") or {}).get(ROUTING_QUESTION_ID) or {}
         return ans.get("choice"), ans.get("confidence")
     except Exception as e:
         logger.debug("jev classify failed (fail-open): %s", e)
         return None, None
+
+
+def _budget_call(session_id, features, cfg):
+    """Serialize admission per session; persist spend before allowing another call.
+
+    Provider cost is known only after dispatch. One admitted call can exceed the
+    cap; an unknown outcome remains blocked until the session is changed.
+    """
+    # ponytail: one in-flight classifier call per session; parallel reservation
+    # accounting is needed only if classifying overlapping turns becomes vital.
+    try:
+        cap = float(cfg.get("classifier_spend_cap_usd", DEFAULT_CLASSIFIER_SPEND_CAP_USD))
+        if isinstance(cfg.get("classifier_spend_cap_usd"), bool) or not math.isfinite(cap) or cap <= 0:
+            return None, "classifier_spend_cap_reached"
+        if not session_id:
+            return None, "classifier_session_missing"
+        directory = os.path.dirname(CLASSIFIER_BUDGET_PATH)
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        os.chmod(directory, 0o700)
+        fd = os.open(CLASSIFIER_BUDGET_PATH, os.O_CREAT | os.O_RDWR
+                     | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_nlink != 1:
+                raise OSError("unsafe classifier budget file")
+            os.fchmod(fd, 0o600)
+        finally:
+            os.close(fd)
+        session_key = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+        with sqlite3.connect(CLASSIFIER_BUDGET_PATH, timeout=0.2) as db:
+            db.execute("CREATE TABLE IF NOT EXISTS session_spend "
+                       "(session TEXT PRIMARY KEY, cost_nanos INTEGER NOT NULL, "
+                       "in_flight INTEGER NOT NULL)")
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT cost_nanos, in_flight FROM session_spend WHERE session = ?",
+                             (session_key,)).fetchone()
+            spent, in_flight = row or (0, 0)
+            if in_flight:
+                return None, "classifier_spend_pending"
+            if Decimal(spent) >= Decimal(str(cap)) * 1_000_000_000:
+                return None, "classifier_spend_cap_reached"
+            db.execute("INSERT INTO session_spend (session, cost_nanos, in_flight) VALUES (?, ?, 1) "
+                       "ON CONFLICT(session) DO UPDATE SET in_flight = 1", (session_key, spent))
+            db.commit()
+    except (OSError, sqlite3.Error, ValueError, TypeError, OverflowError):
+        return None, "classifier_budget_unavailable"
+
+    telemetry = {}
+    pool, confidence = _classify(features, cfg, telemetry)
+    cost = telemetry.get("classifier_cost_usd")
+    try:
+        amount = Decimal(str(cost))
+        if isinstance(cost, bool) or not amount.is_finite() or amount < 0:
+            raise InvalidOperation
+        nanos = int((amount * 1_000_000_000).to_integral_value(rounding=ROUND_CEILING))
+        if nanos > 9_223_372_036_854_775_807 - spent:
+            raise OverflowError("classifier spend exceeds ledger capacity")
+        with sqlite3.connect(CLASSIFIER_BUDGET_PATH, timeout=0.2) as db:
+            db.execute("UPDATE session_spend SET cost_nanos = ?, in_flight = 0 WHERE session = ?",
+                       (spent + nanos, session_key))
+    except (OSError, sqlite3.Error, ValueError, TypeError, InvalidOperation, OverflowError):
+        # Keep the durable in-flight marker: an unknown charge must not reset
+        # the budget after a timeout, process crash, or ledger write failure.
+        telemetry["classifier_accounting_uncertain"] = True
+    return (pool, confidence, telemetry), None
 
 
 def _session_override(session_id):
@@ -619,7 +687,8 @@ def on_llm_request(**kwargs):
                   "provider": provider, "model": model, "pool": None,
                   "confidence": None, "gate": None, "eligible": False,
                   "mode": str(cfg.get("mode", "shadow")).lower(),
-                  "applied": False, "skip_reason": reason})
+                  "applied": False, "skip_reason": reason, "excerpt_sent": False,
+                  "classifier_cost_usd": None, "classifier_usage": None})
             return None
 
         # ---- PER-REQUEST KILL SWITCH (v1.0.8) ------------------------------
@@ -801,8 +870,11 @@ def on_llm_request(**kwargs):
 
         feats = _features(request, excerpt_chars=int(cfg.get("excerpt_chars",
                                                              DEFAULT_EXCERPT_CHARS)),
-                          include_excerpt=bool(cfg.get("send_excerpt", True)))
-        pool, confidence = _classify(feats, cfg)
+                          include_excerpt=cfg.get("send_excerpt") is True)
+        classified, budget_reason = _budget_call(session_id, feats, cfg)
+        if budget_reason:
+            return _skip(budget_reason)
+        pool, confidence, telemetry = classified
 
         gate = float(cfg.get("confidence_gate", DEFAULT_GATE))
         free_model = _rung(cfg, provider, "free", "free_model")
@@ -937,7 +1009,7 @@ def on_llm_request(**kwargs):
         _store_decision(key, provider, decision, target,
                         float(confidence) if confidence is not None else 0.0)
 
-        log_feats = feats if cfg.get("send_excerpt", True) else {
+        log_feats = feats if cfg.get("send_excerpt") is True else {
             k: v for k, v in feats.items() if k != "task_excerpt"}
         _log({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "turn_id": turn_id,
               "session_id": session_id,
@@ -961,7 +1033,7 @@ def on_llm_request(**kwargs):
               "flash_model": flash_model if flash_eligible else None,
               "premium_model": premium if esc_eligible else None,
               "credit_ok": credit_ok,
-              "features": log_feats})
+              "features": log_feats, **telemetry})
 
         if mode != "live":
             return None  # shadow: decide + log only, original request untouched
