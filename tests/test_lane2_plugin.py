@@ -231,8 +231,7 @@ def test_rung_falls_back_to_flat_key():
     cfg = _cfg(mode="live")          # no 'rungs' -> flat premium_model used
     assert pl._rung(cfg, "nous", "premium", "premium_model") == \
         "anthropic/claude-sonnet-5.5"
-    assert pl._rung(cfg, "unknown-provider", "free", "free_model") == \
-        "inclusionai/ling-3.0-flash-sante:free"
+    assert pl._rung(cfg, "unknown-provider", "free", "free_model") is None
 
 
 # --------------------------------------------------------------- features
@@ -511,6 +510,156 @@ def test_log_failure_falls_back_to_stderr_without_prompt(monkeypatch, tmp_path, 
     assert "SECRET_PROMPT_CANARY" not in err
 
 
+@pytest.mark.parametrize("has_stderr_handler", [False, True])
+def test_log_failure_warns_when_logger_is_silent(monkeypatch, tmp_path, capsys,
+                                                has_stderr_handler):
+    log = tmp_path / "routing.jsonl"
+    log.mkdir()
+    handlers = [logging.StreamHandler(sys.stderr)] if has_stderr_handler else []
+    monkeypatch.setattr(pl, "LOG_PATH", str(log))
+    monkeypatch.setattr(pl, "_LOG_FAILURES", 0)
+    monkeypatch.setattr(pl, "_LOG_LAST_WARNING", None)
+    monkeypatch.setattr(pl.logger, "warning", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pl.logger, "handlers", handlers)
+    monkeypatch.setattr(pl.logger, "propagate", False)
+    monkeypatch.setattr(pl.logger, "level", logging.WARNING)
+    monkeypatch.setattr(pl.logger, "disabled", False)
+    monkeypatch.setattr(pl.logger, "filters", [])
+    pl._log({"task_excerpt": "SECRET_PROMPT_CANARY"})
+    err = capsys.readouterr().err
+    assert len(err.splitlines()) == 1
+    assert "routing log failed" in err and str(log) in err
+    assert "SECRET_PROMPT_CANARY" not in err
+    assert pl.get_log_failure_count() == 1
+
+
+def test_log_failure_falls_back_to_stderr_with_file_handler(monkeypatch, tmp_path, capsys):
+    log = tmp_path / "routing.jsonl"
+    log.mkdir()
+    warning_log = tmp_path / "warnings.log"
+    handler = logging.FileHandler(warning_log)
+    monkeypatch.setattr(pl, "LOG_PATH", str(log))
+    monkeypatch.setattr(pl, "_LOG_FAILURES", 0)
+    monkeypatch.setattr(pl, "_LOG_LAST_WARNING", None)
+    monkeypatch.setattr(pl.logger, "handlers", [handler])
+    monkeypatch.setattr(pl.logger, "propagate", False)
+    monkeypatch.setattr(pl.logger, "level", logging.WARNING)
+    try:
+        pl._log({"task_excerpt": "SECRET_PROMPT_CANARY"})
+        pl._log({"task_excerpt": "SECRET_PROMPT_CANARY"})
+    finally:
+        handler.close()
+    err = capsys.readouterr().err
+    assert len(err.splitlines()) == 1
+    assert "routing log failed" in err and str(log) in err
+    assert "SECRET_PROMPT_CANARY" not in err
+    assert "routing log failed" in warning_log.read_text()
+    assert pl.get_log_failure_count() == 2
+
+
+def test_log_failure_does_not_duplicate_real_stderr_handler(monkeypatch, tmp_path, capsys):
+    log = tmp_path / "routing.jsonl"
+    log.mkdir()
+    monkeypatch.setattr(pl, "LOG_PATH", str(log))
+    monkeypatch.setattr(pl, "_LOG_FAILURES", 0)
+    monkeypatch.setattr(pl, "_LOG_LAST_WARNING", None)
+    monkeypatch.setattr(pl.logger, "handlers", [logging.StreamHandler(sys.stderr)])
+    monkeypatch.setattr(pl.logger, "propagate", False)
+    monkeypatch.setattr(pl.logger, "level", logging.WARNING)
+    pl._log({"task_excerpt": "SECRET_PROMPT_CANARY"})
+    pl._log({"task_excerpt": "SECRET_PROMPT_CANARY"})
+    err = capsys.readouterr().err
+    assert err.count("routing log failed") == 1
+    assert str(log) in err and "SECRET_PROMPT_CANARY" not in err
+    assert pl.get_log_failure_count() == 2
+
+
+def test_log_failure_still_warns_when_stderr_handler_filters_warning(monkeypatch, tmp_path, capsys):
+    log = tmp_path / "routing.jsonl"
+    log.mkdir()
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setLevel(logging.ERROR)
+    monkeypatch.setattr(pl, "LOG_PATH", str(log))
+    monkeypatch.setattr(pl, "_LOG_FAILURES", 0)
+    monkeypatch.setattr(pl, "_LOG_LAST_WARNING", None)
+    monkeypatch.setattr(pl.logger, "handlers", [handler])
+    monkeypatch.setattr(pl.logger, "propagate", False)
+    monkeypatch.setattr(pl.logger, "level", logging.WARNING)
+    pl._log({"task_excerpt": "SECRET_PROMPT_CANARY"})
+    err = capsys.readouterr().err
+    assert len(err.splitlines()) == 1
+    assert "routing log failed" in err and str(log) in err
+    assert "SECRET_PROMPT_CANARY" not in err
+
+
+def test_log_failure_still_warns_when_logger_is_disabled(monkeypatch, tmp_path, capsys):
+    log = tmp_path / "routing.jsonl"
+    log.mkdir()
+    monkeypatch.setattr(pl, "LOG_PATH", str(log))
+    monkeypatch.setattr(pl, "_LOG_FAILURES", 0)
+    monkeypatch.setattr(pl, "_LOG_LAST_WARNING", None)
+    monkeypatch.setattr(pl.logger, "handlers", [logging.StreamHandler(sys.stderr)])
+    monkeypatch.setattr(pl.logger, "propagate", False)
+    monkeypatch.setattr(pl.logger, "disabled", True)
+    pl._log({"task_excerpt": "SECRET_PROMPT_CANARY"})
+    err = capsys.readouterr().err
+    assert len(err.splitlines()) == 1
+    assert "routing log failed" in err and str(log) in err
+    assert "SECRET_PROMPT_CANARY" not in err
+
+
+def test_log_failure_still_warns_when_logger_filter_rejects(monkeypatch, tmp_path, capsys):
+    log = tmp_path / "routing.jsonl"
+    log.mkdir()
+    monkeypatch.setattr(pl, "LOG_PATH", str(log))
+    monkeypatch.setattr(pl, "_LOG_FAILURES", 0)
+    monkeypatch.setattr(pl, "_LOG_LAST_WARNING", None)
+    monkeypatch.setattr(pl.logger, "handlers", [logging.StreamHandler(sys.stderr)])
+    monkeypatch.setattr(pl.logger, "filters", [lambda record: False])
+    monkeypatch.setattr(pl.logger, "propagate", False)
+    monkeypatch.setattr(pl.logger, "level", logging.WARNING)
+    pl._log({"task_excerpt": "SECRET_PROMPT_CANARY"})
+    err = capsys.readouterr().err
+    assert len(err.splitlines()) == 1
+    assert "routing log failed" in err and str(log) in err
+    assert "SECRET_PROMPT_CANARY" not in err
+
+
+def test_log_failure_does_not_duplicate_propagated_stderr_handler(monkeypatch, tmp_path, capsys):
+    log = tmp_path / "routing.jsonl"
+    log.mkdir()
+    monkeypatch.setattr(pl, "LOG_PATH", str(log))
+    monkeypatch.setattr(pl, "_LOG_FAILURES", 0)
+    monkeypatch.setattr(pl, "_LOG_LAST_WARNING", None)
+    monkeypatch.setattr(pl.logger, "handlers", [])
+    monkeypatch.setattr(pl.logger, "propagate", True)
+    monkeypatch.setattr(pl.logger, "level", logging.WARNING)
+    monkeypatch.setattr(logging.root, "handlers", [logging.StreamHandler(sys.stderr)])
+    pl._log({"task_excerpt": "SECRET_PROMPT_CANARY"})
+    pl._log({"task_excerpt": "SECRET_PROMPT_CANARY"})
+    err = capsys.readouterr().err
+    assert len(err.splitlines()) == 1
+    assert "routing log failed" in err and str(log) in err
+    assert "SECRET_PROMPT_CANARY" not in err
+    assert pl.get_log_failure_count() == 2
+
+
+def test_log_failure_does_not_duplicate_last_resort_stderr(monkeypatch, tmp_path, capsys):
+    log = tmp_path / "routing.jsonl"
+    log.mkdir()
+    monkeypatch.setattr(pl, "LOG_PATH", str(log))
+    monkeypatch.setattr(pl, "_LOG_FAILURES", 0)
+    monkeypatch.setattr(pl, "_LOG_LAST_WARNING", None)
+    monkeypatch.setattr(pl.logger, "handlers", [])
+    monkeypatch.setattr(pl.logger, "propagate", False)
+    monkeypatch.setattr(pl.logger, "level", logging.WARNING)
+    pl._log({"task_excerpt": "SECRET_PROMPT_CANARY"})
+    err = capsys.readouterr().err
+    assert len(err.splitlines()) == 1
+    assert "routing log failed" in err and str(log) in err
+    assert "SECRET_PROMPT_CANARY" not in err
+
+
 def test_log_falls_back_to_stderr_when_warning_handler_fails(monkeypatch, tmp_path, capsys):
     log = tmp_path / "routing.jsonl"
     log.mkdir()
@@ -526,6 +675,49 @@ def test_log_falls_back_to_stderr_when_warning_handler_fails(monkeypatch, tmp_pa
     monkeypatch.setattr(pl.logger, "propagate", False)
     pl._log({"task_excerpt": "SECRET_PROMPT_CANARY"})
     err = capsys.readouterr().err
+    assert "routing log failed" in err and str(log) in err
+    assert "SECRET_PROMPT_CANARY" not in err
+    assert pl.get_log_failure_count() == 1
+
+
+def test_log_falls_back_when_warning_raises_with_null_handler(monkeypatch, tmp_path, capsys):
+    log = tmp_path / "routing.jsonl"
+    log.mkdir()
+    monkeypatch.setattr(pl, "LOG_PATH", str(log))
+    monkeypatch.setattr(pl, "_LOG_FAILURES", 0)
+    monkeypatch.setattr(pl, "_LOG_LAST_WARNING", None)
+    monkeypatch.setattr(pl.logger, "handlers", [logging.NullHandler()])
+    monkeypatch.setattr(pl.logger, "propagate", False)
+    monkeypatch.setattr(pl.logger, "level", logging.WARNING)
+
+    def broken_warning(*args, **kwargs):
+        raise OSError("warning unavailable")
+
+    monkeypatch.setattr(pl.logger, "warning", broken_warning)
+    pl._log({"task_excerpt": "SECRET_PROMPT_CANARY"})
+    err = capsys.readouterr().err
+    assert len(err.splitlines()) == 1
+    assert "routing log failed" in err and str(log) in err
+    assert "SECRET_PROMPT_CANARY" not in err
+    assert pl.get_log_failure_count() == 1
+
+
+def test_log_falls_back_when_warning_raises_with_stderr_handler(monkeypatch, tmp_path, capsys):
+    log = tmp_path / "routing.jsonl"
+    log.mkdir()
+    monkeypatch.setattr(pl, "LOG_PATH", str(log))
+    monkeypatch.setattr(pl, "_LOG_FAILURES", 0)
+    monkeypatch.setattr(pl, "_LOG_LAST_WARNING", None)
+    monkeypatch.setattr(pl.logger, "handlers", [logging.StreamHandler(sys.stderr)])
+    monkeypatch.setattr(pl.logger, "propagate", False)
+
+    def broken_warning(*args, **kwargs):
+        raise OSError("warning unavailable")
+
+    monkeypatch.setattr(pl.logger, "warning", broken_warning)
+    pl._log({"task_excerpt": "SECRET_PROMPT_CANARY"})
+    err = capsys.readouterr().err
+    assert len(err.splitlines()) == 1
     assert "routing log failed" in err and str(log) in err
     assert "SECRET_PROMPT_CANARY" not in err
     assert pl.get_log_failure_count() == 1
@@ -884,6 +1076,45 @@ def test_error_hook_skips_empty_rungs(monkeypatch):
     _reset_decisions()
     pl.on_api_request_error(**_err_kwargs(_LING, 429))
     assert pl._session_override("s1") == _cfg7()["premium_model"]
+
+
+def test_opencode_429_cannot_arm_or_rewrite_using_flat_nous_rungs(monkeypatch):
+    cfg = _cfg7(rungs={}, route_providers=["opencode-go"],
+                escalate_providers=["opencode-go"])
+    recs = []
+    monkeypatch.setattr(pl, "_load_config", lambda: cfg)
+    monkeypatch.setattr(pl, "_log", recs.append)
+    _reset_decisions()
+    kw = _kwargs(provider="opencode-go", model="opencode-free", api_call_count=2)
+    before = dict(kw["request"])
+    pl.on_api_request_error(status_code=429, provider="opencode-go", session_id="s1",
+                            request={"method": "POST", "body": kw["request"]})
+    out = pl.on_llm_request(**kw)
+    seen = []
+    context = {key: value for key, value in kw.items() if key != "request"}
+    pl.on_llm_execution(request=kw["request"], next_call=seen.append, **context)
+    assert pl._session_override("s1") is None
+    assert not any(row.get("skip_reason") == "error_override_armed" for row in recs)
+    assert out is None
+    assert seen == [before] and seen[0] is kw["request"]
+    assert kw["request"] == before
+
+
+def test_flat_nous_rungs_do_not_trigger_other_provider_routing(monkeypatch):
+    cfg = _cfg7(rungs={}, route_providers=["opencode-go"],
+                escalate_providers=["opencode-go"])
+    classified, recs = [], []
+    monkeypatch.setattr(pl, "_load_config", lambda: cfg)
+    monkeypatch.setattr(pl, "_classify",
+                        lambda feats, config: classified.append(1) or ("free", 0.50))
+    monkeypatch.setattr(pl, "_log", recs.append)
+    _reset_decisions()
+    kw = _kwargs(provider="opencode-go", model="opencode-paid")
+    before = dict(kw["request"])
+    assert pl.on_llm_request(**kw) is None
+    assert kw["request"] == before
+    assert classified == []
+    assert recs[-1]["skip_reason"] == "no_rungs_configured"
 
 
 def test_error_override_rewrites_next_request(monkeypatch):
@@ -1363,3 +1594,247 @@ def test_reapply_decision_keys_unchanged_and_provider_still_pinned(monkeypatch):
     # follow-up on ANOTHER provider is never rewritten (decision pinned)
     assert pl.on_llm_request(**_kwargs(provider="other", model=_SONNET,
                                        turn_id="r7-4", api_call_count=2)) is None
+
+
+def test_armed_override_reaches_provider_after_cached_decision(monkeypatch):
+    recs = []
+    monkeypatch.setattr(pl, "_load_config", lambda: _cfg7(mode="live"))
+    monkeypatch.setattr(pl, "_classify", lambda features, config: ("free", 0.99))
+    monkeypatch.setattr(pl, "_log", recs.append)
+    _reset_decisions()
+    kw = _kwargs(model=_SONNET, turn_id="failed-turn")
+    kw["request"]["tools"] = [{"type": "function", "function": {"name": "lookup"}}]
+    first = pl.on_llm_request(**kw)
+    assert first["request"]["model"] == _LING
+    pl.on_api_request_error(status_code=429, provider="nous", session_id="s1",
+                            request={"method": "POST", "body": first["request"]})
+    assert pl._session_override("s1") == _FLASH
+    retry = pl.on_llm_request(**kw)
+    assert retry["request"] == {**kw["request"], "model": _FLASH}
+    rows_before_execution = list(recs)
+    seen = []
+    context = {k: v for k, v in kw.items() if k != "request"}
+    pl.on_llm_execution(request=retry["request"],
+                        next_call=lambda request: seen.append(request), **context)
+    assert seen == [{**kw["request"], "model": _FLASH}]
+    assert seen[0] is retry["request"]
+    assert recs == rows_before_execution
+    assert len([row for row in recs if row.get("skip_reason") == "error_override_applied"]) == 1
+
+
+@pytest.mark.parametrize("armed_provider,failed_model,other_provider,other_model", [
+    ("nous", _LING, "opencode-go", "glm-5.3"),
+    ("opencode-go", "opencode-free", "nous", _SONNET),
+])
+@pytest.mark.parametrize("hook", ["request", "execution"])
+def test_armed_override_never_crosses_providers(monkeypatch, armed_provider, failed_model,
+                                               other_provider, other_model, hook):
+    cfg = _cfg7(rungs={"nous": {"free": _LING, "flash": _FLASH},
+                       "opencode-go": {"free": "opencode-free", "flash": "glm-5.3-flash"}})
+    recs = []
+    monkeypatch.setattr(pl, "_load_config", lambda: cfg)
+    monkeypatch.setattr(pl, "_log", recs.append)
+    _reset_decisions()
+    pl.on_api_request_error(status_code=429, provider=armed_provider, session_id="s1",
+                            request={"body": {"model": failed_model}})
+    assert recs[-1]["skip_reason"] == "error_override_armed"
+    assert pl._SESSION_OVERRIDE["s1"]["provider"] == armed_provider
+    arm_target = _FLASH if armed_provider == "nous" else "glm-5.3-flash"
+    own = _kwargs(provider=armed_provider, model=failed_model, api_call_count=2)
+    if hook == "request":
+        assert pl.on_llm_request(**own)["request"]["model"] == arm_target
+    else:
+        own_seen = []
+        own_context = {key: value for key, value in own.items() if key != "request"}
+        pl.on_llm_execution(request=own["request"], next_call=own_seen.append, **own_context)
+        assert own_seen == [{**own["request"], "model": arm_target}]
+    recs.clear()
+    kw = _kwargs(provider=other_provider, model=other_model, api_call_count=2)
+    before = dict(kw["request"])
+    if hook == "request":
+        assert pl.on_llm_request(**kw) is None
+    else:
+        seen = []
+        context = {key: value for key, value in kw.items() if key != "request"}
+        pl.on_llm_execution(request=kw["request"], next_call=seen.append, **context)
+        assert seen == [before]
+        assert seen[0] is kw["request"]
+    assert kw["request"] == before
+    assert not any(row.get("skip_reason") == "error_override_applied" for row in recs)
+
+
+@pytest.mark.parametrize("hook", ["request", "execution"])
+def test_override_without_arming_provider_is_inert(monkeypatch, hook):
+    recs = []
+    # A missing provider may still have an explicitly configured ladder; its
+    # override must remain inert for any provider-scoped request (D2).
+    cfg = _cfg7(mode="live", rungs={"": {"free": _LING, "flash": _FLASH}})
+    monkeypatch.setattr(pl, "_load_config", lambda: cfg)
+    monkeypatch.setattr(pl, "_log", recs.append)
+    _reset_decisions()
+    pl.on_api_request_error(status_code=429, session_id="s1",
+                            request={"body": {"model": _LING}})
+    assert recs[-1]["skip_reason"] == "error_override_armed"
+    kw = _kwargs(provider="nous", model=_SONNET, api_call_count=2)
+    before = dict(kw["request"])
+    if hook == "request":
+        assert pl.on_llm_request(**kw) is None
+    else:
+        seen = []
+        context = {key: value for key, value in kw.items() if key != "request"}
+        pl.on_llm_execution(request=kw["request"], next_call=seen.append, **context)
+        assert seen == [before]
+        assert seen[0] is kw["request"]
+    assert kw["request"] == before
+    assert not any(row.get("skip_reason") == "error_override_applied" for row in recs)
+
+
+@pytest.mark.parametrize("hook", ["request", "execution"])
+@pytest.mark.parametrize("stale_context", [False, True])
+def test_armed_override_already_target_never_reapplies_cached_decision(monkeypatch, hook,
+                                                                        stale_context):
+    recs = []
+    monkeypatch.setattr(pl, "_load_config", lambda: _cfg7(mode="live"))
+    monkeypatch.setattr(pl, "_classify", lambda features, config: ("free", 0.99))
+    monkeypatch.setattr(pl, "_log", recs.append)
+    _reset_decisions()
+    original = _kwargs(model=_SONNET, turn_id="already-target")
+    first = pl.on_llm_request(**original)
+    assert first["request"]["model"] == _LING
+    pl.on_api_request_error(status_code=429, provider="nous", session_id="s1",
+                            request={"body": first["request"]})
+    kw = _kwargs(model=_FLASH, turn_id="already-target", api_call_count=2)
+    if stale_context:
+        kw["model"] = _SONNET
+    rows_before = list(recs)
+    before = dict(kw["request"])
+    if hook == "request":
+        assert pl.on_llm_request(**kw) is None
+    else:
+        seen = []
+        context = {key: value for key, value in kw.items() if key != "request"}
+        pl.on_llm_execution(request=kw["request"], next_call=seen.append, **context)
+        assert seen == [before]
+        assert seen[0] is kw["request"]
+    assert kw["request"] == before
+    assert recs == rows_before
+
+
+@pytest.mark.parametrize("mode", ["shadow", "SHADOW", None])
+def test_armed_override_in_shadow_execution_leaves_payload_untouched(monkeypatch, mode):
+    cfg = _cfg7(mode="live")
+    recs = []
+    monkeypatch.setattr(pl, "_load_config", lambda: cfg)
+    monkeypatch.setattr(pl, "_classify", lambda features, config: ("free", 0.99))
+    monkeypatch.setattr(pl, "_log", recs.append)
+    _reset_decisions()
+    kw = _kwargs(model=_SONNET, turn_id="shadow-exec")
+    first = pl.on_llm_request(**kw)
+    assert first["request"]["model"] == _LING
+    pl.on_api_request_error(status_code=429, provider="nous", session_id="s1",
+                            request={"body": first["request"]})
+    if mode is None:
+        cfg.pop("mode")
+    else:
+        cfg["mode"] = mode
+    recs.clear()
+    before = dict(kw["request"])
+    seen = []
+    context = {key: value for key, value in kw.items() if key != "request"}
+    assert pl.on_llm_request(**kw) is None
+    pl.on_llm_execution(request=kw["request"], next_call=seen.append, **context)
+    assert seen == [before]
+    assert kw["request"] == before
+    assert not any(row.get("applied") or row.get("escalate_applied") for row in recs)
+
+
+@pytest.mark.parametrize("flag", [
+    {"extra_headers": {"X-KFC-Router": "off"}}, {"metadata": {"router": "off"}},
+])
+def test_armed_override_respects_kill_switch_in_both_hooks(monkeypatch, flag):
+    recs = []
+    monkeypatch.setattr(pl, "_load_config", lambda: _cfg7(mode="live"))
+    monkeypatch.setattr(pl, "_classify", lambda features, config: ("free", 0.99))
+    monkeypatch.setattr(pl, "_log", recs.append)
+    _reset_decisions()
+    kw = _kwargs(model=_SONNET, turn_id="kill-exec")
+    first = pl.on_llm_request(**kw)
+    assert first["request"]["model"] == _LING
+    pl.on_api_request_error(status_code=429, provider="nous", session_id="s1",
+                            request={"body": first["request"]})
+    kw["request"].update(flag)
+    recs.clear()
+    assert pl.on_llm_request(**kw) is None
+    assert len(recs) == 1 and recs[0]["skip_reason"] == "disabled_by_request"
+    before = dict(kw["request"])
+    seen = []
+    context = {key: value for key, value in kw.items() if key != "request"}
+    pl.on_llm_execution(request=kw["request"], next_call=seen.append, **context)
+    assert seen == [before] and seen[0] is kw["request"]
+    assert kw["request"] == before
+    assert len(recs) == 1 and not recs[0]["applied"]
+
+
+@pytest.mark.parametrize("tier,pool,confidence,source,cached_target", [
+    ("free", "free", 0.99, _SONNET, _LING),
+    ("mid", "free", 0.70, _SONNET, _MID),
+    ("flash", "free", 0.50, _SONNET, _FLASH),
+    ("paid", "paid", 0.90, _GPT, _SONNET),
+])
+def test_armed_override_beats_cached_tier_in_execution(monkeypatch, tier, pool, confidence,
+                                                       source, cached_target):
+    recs, probes = [], []
+    monkeypatch.setattr(pl, "_load_config", lambda: _cfg7(mode="live"))
+    monkeypatch.setattr(pl, "_classify", lambda features, config: (pool, confidence))
+    monkeypatch.setattr(pl, "_paid_lane_alive", lambda: probes.append(1) or True)
+    monkeypatch.setattr(pl, "_log", recs.append)
+    _reset_decisions()
+    kw = _kwargs(model=source, turn_id="tier-override")
+    first = pl.on_llm_request(**kw)
+    assert first["request"]["model"] == cached_target
+    assert pl._DECISIONS["s1:tier-override"]["decision"] == tier
+    pl.on_api_request_error(status_code=429, provider="nous", session_id="s1",
+                            request={"body": {"model": _LING}})
+    kw["request"]["tools"] = [{"type": "function", "function": {"name": "lookup"}}]
+    opaque = object()
+    kw["request"].update({"metadata": {"trace": "keep"}, "temperature": 0.25,
+                          "stream": False, "future_option": opaque})
+    before = dict(kw["request"])
+    seen = []
+    context = {key: value for key, value in kw.items() if key != "request"}
+    recs.clear()
+    probes.clear()
+    pl.on_llm_execution(request=kw["request"], next_call=seen.append, **context)
+    assert seen == [{**before, "model": _FLASH}]
+    assert seen[0] is not kw["request"]
+    assert seen[0]["future_option"] is opaque
+    assert kw["request"] == before
+    assert probes == []
+    assert len(recs) == 1
+    assert recs[0]["skip_reason"] == "error_override_applied"
+    assert recs[0]["applied"] is True and recs[0]["reapply"] is True
+
+
+def test_armed_override_exec_alone_propagates_downstream_error_once(monkeypatch):
+    recs, seen = [], []
+    monkeypatch.setattr(pl, "_load_config", lambda: _cfg7(mode="live"))
+    monkeypatch.setattr(pl, "_log", recs.append)
+    _reset_decisions()
+    pl.on_api_request_error(status_code=429, provider="nous", session_id="s1",
+                            request={"body": {"model": _LING}})
+    kw = _kwargs(model=_SONNET, turn_id="error-exec", api_call_count=2)
+    before = dict(kw["request"])
+    context = {key: value for key, value in kw.items() if key != "request"}
+    failure = RuntimeError("provider error")
+
+    def fail(request):
+        seen.append(request)
+        raise failure
+
+    with pytest.raises(RuntimeError) as exc:
+        pl.on_llm_execution(request=kw["request"], next_call=fail, **context)
+    assert exc.value is failure
+    assert seen == [{**before, "model": _FLASH}]
+    assert kw["request"] == before
+    applied = [row for row in recs if row.get("skip_reason") == "error_override_applied"]
+    assert len(applied) == 1 and applied[0]["reapply"] is True
