@@ -1082,6 +1082,7 @@ _MALFORMED_ERROR_ENVELOPES = [
     {"body": {"model": 42}}, {"body": {"model": True}},
     {"body": {"model": ["fake-model"]}}, {"body": {"model": {}}},
     {"body": "not-a-dict"}, "not-a-dict",
+    {"body": {"model": b"x"}},
 ]
 
 
@@ -1107,7 +1108,8 @@ def _spy_session_override(monkeypatch):
 
 
 # Truncated, missing envelope/body/model, blank/whitespace, and non-string
-# shapes are sampled; the whole-hook spy, not this list, guards state per case.
+# shapes are sampled; the whole-hook spy, not this list, enforces non-mutation
+# for each sampled envelope. No finite list covers every conceivable shape.
 @pytest.mark.parametrize("envelope", [
     {"_truncated": True, "original_type": "dict",
      "preview": '{"method": "POST", "body": {"model": "%s"}}' % _FLASH},
@@ -1115,7 +1117,7 @@ def _spy_session_override(monkeypatch):
 ], ids=["truncated_with_model_in_preview", "none", "empty_envelope", "method_only",
         "empty_body", "none_model", "empty_str_model", "whitespace_model",
         "int_model", "bool_model", "list_model", "dict_model", "body_not_dict",
-        "envelope_not_dict"])
+        "envelope_not_dict", "bytes_model"])
 def test_missing_body_model_keeps_existing_override(monkeypatch, envelope):
     premium = "openai/gpt-6.1-terra"
     cfg = _cfg7(rungs={"nous": {"free": _LING, "flash": _FLASH,
