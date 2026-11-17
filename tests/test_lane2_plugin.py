@@ -1037,14 +1037,57 @@ def test_error_hook_arms_from_host_request_envelope(monkeypatch, status):
     assert recs[-1]["error_status"] == status
 
 
-def test_error_hook_falls_back_to_top_level_model(monkeypatch):
+@pytest.mark.parametrize("failed_model, agent_model", [
+    pytest.param(_LING, _SONNET, id="trunc_failing_free"),
+    pytest.param(_FLASH, _SONNET, id="trunc_failing_flash"),
+    pytest.param(_MID, _SONNET, id="trunc_failing_mid"),
+    pytest.param(_LING, "openai/gpt-6.1-terra", id="trunc_agent_model_is_premium"),
+    pytest.param(_LING, "", id="trunc_agent_model_empty"),
+])
+def test_truncated_error_does_not_arm_from_configured_model(monkeypatch, failed_model, agent_model):
+    # Match Qui's five probes; failed_model is not recoverable from the envelope.
+    rungs = {"free": _LING, "flash": _FLASH, "mid": _MID,
+             "premium": "openai/gpt-6.1-terra"}
+    cfg = _cfg7(rungs={"nous": rungs})
+    recs = []
+    monkeypatch.setattr(pl, "_load_config", lambda: cfg)
+    monkeypatch.setattr(pl, "_log", recs.append)
+    envelope = {"_truncated": True, "original_type": "dict",
+                "preview": '{"method": "POST", "body": {"model": "..."}}'}
+
+    # A configured model is never a substitute for the missing failed model.
+    for configured in (agent_model, _SONNET):
+        _reset_decisions()
+        recs.clear()
+        pl.on_api_request_error(status_code=429, provider="nous", session_id="s1",
+                                turn_id="e1", model=configured, request=envelope)
+        assert pl._session_override("s1") is None
+        assert recs == []
+
+        # With no error override, neither middleware may rewrite this retry.
+        kw = _kwargs(model=failed_model, api_call_count=2, turn_id="e1")
+        before = dict(kw["request"])
+        assert pl.on_llm_request(**kw) is None
+        seen = []
+        context = {key: value for key, value in kw.items() if key != "request"}
+        pl.on_llm_execution(request=kw["request"], next_call=seen.append, **context)
+        assert seen == [before] and kw["request"] == before
+
+
+@pytest.mark.parametrize("envelope", [
+    None, {}, {"method": "POST"}, {"body": {}}, {"body": {"model": None}},
+    {"body": {"model": ""}}, {"body": {"model": "   "}},
+    {"body": {"model": 42}}, {"body": {"model": True}},
+    {"body": {"model": ["fake-model"]}}, {"body": {"model": {}}},
+    {"body": "not-a-dict"}, "not-a-dict",
+])
+def test_error_hook_missing_body_model_fails_open(monkeypatch, envelope):
     monkeypatch.setattr(pl, "_load_config", lambda: _cfg7())
     monkeypatch.setattr(pl, "_log", lambda rec: None)
     _reset_decisions()
     pl.on_api_request_error(status_code=429, session_id="host-session",
-                            provider="nous", model=_LING,
-                            request={"method": "POST", "body": {}})
-    assert pl._session_override("host-session") == _FLASH
+                            provider="nous", model=_LING, request=envelope)
+    assert pl._session_override("host-session") is None
 
 
 @pytest.mark.parametrize("status", [401, 404, 429])
