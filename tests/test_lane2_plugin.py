@@ -14,6 +14,7 @@ import logging
 import os
 import stat
 import sys
+import time
 
 import pytest
 
@@ -1045,7 +1046,7 @@ def test_error_hook_arms_from_host_request_envelope(monkeypatch, status):
     pytest.param(_LING, "", id="trunc_agent_model_empty"),
 ])
 def test_truncated_error_does_not_arm_from_configured_model(monkeypatch, failed_model, agent_model):
-    # Match Qui's five probes; failed_model is not recoverable from the envelope.
+    # The truncated preview does not identify the model that failed.
     rungs = {"free": _LING, "flash": _FLASH, "mid": _MID,
              "premium": "openai/gpt-6.1-terra"}
     cfg = _cfg7(rungs={"nous": rungs})
@@ -1088,6 +1089,33 @@ def test_error_hook_missing_body_model_fails_open(monkeypatch, envelope):
     pl.on_api_request_error(status_code=429, session_id="host-session",
                             provider="nous", model=_LING, request=envelope)
     assert pl._session_override("host-session") is None
+
+
+@pytest.mark.parametrize("envelope", [
+    {"_truncated": True, "original_type": "dict",
+     "preview": '{"method": "POST", "body": {"model": "%s"}}' % _FLASH},
+    None,
+    {"body": {}},
+], ids=["truncated_with_model_in_preview", "none", "empty_body"])
+def test_missing_body_model_keeps_existing_override(monkeypatch, envelope):
+    premium = "openai/gpt-6.1-terra"
+    cfg = _cfg7(rungs={"nous": {"free": _LING, "flash": _FLASH,
+                                "mid": _MID, "premium": premium}})
+    monkeypatch.setattr(pl, "_load_config", lambda: cfg)
+    monkeypatch.setattr(pl, "_log", lambda rec: None)
+    _reset_decisions()
+    previous = {"model": premium, "provider": "nous", "ts": time.monotonic()}
+    with pl._SESSION_OVERRIDE_LOCK:
+        pl._SESSION_OVERRIDE["s-keep"] = dict(previous)
+    try:
+        assert pl._session_override("s-keep", "nous") == premium
+        pl.on_api_request_error(status_code=429, provider="nous", session_id="s-keep",
+                                turn_id="t-keep", model=_SONNET, request=envelope)
+        assert pl._session_override("s-keep", "nous") == premium
+        with pl._SESSION_OVERRIDE_LOCK:
+            assert pl._SESSION_OVERRIDE["s-keep"] == previous
+    finally:
+        _reset_decisions()
 
 
 @pytest.mark.parametrize("status", [401, 404, 429])
