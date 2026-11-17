@@ -1096,7 +1096,10 @@ def test_error_hook_missing_body_model_fails_open(monkeypatch, envelope):
      "preview": '{"method": "POST", "body": {"model": "%s"}}' % _FLASH},
     None,
     {"body": {}},
-], ids=["truncated_with_model_in_preview", "none", "empty_body"])
+    {"body": {"model": ""}},
+    {"body": {"model": 42}},
+], ids=["truncated_with_model_in_preview", "none", "empty_body",
+        "empty_str_model", "int_model"])
 def test_missing_body_model_keeps_existing_override(monkeypatch, envelope):
     premium = "openai/gpt-6.1-terra"
     cfg = _cfg7(rungs={"nous": {"free": _LING, "flash": _FLASH,
