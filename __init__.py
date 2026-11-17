@@ -288,7 +288,7 @@ def _load_config():
            # PER-PROVIDER RUNGS. A rewrite must NEVER cross providers: the
            # request's base_url/api_key belong to the originating provider, so
            # swapping only the model id would send the wrong id to the wrong
-           # endpoint. Resolved per provider, falling back to the flat keys.
+           # endpoint. Flat fallback keys are the legacy nous ladder only.
            "rungs": {},
            # v1.0.12: free is the DEFAULT rung, so a free-source turn is
            # classified and can route UP on a hard verdict. See
@@ -313,11 +313,11 @@ def _load_config():
 
 
 def _rung(cfg, provider, key, fallback_key):
-    """Per-provider rung with a flat-key fallback. Keeps a rewrite same-provider."""
+    """Per-provider rung; legacy flat keys belong only to nous."""
     rungs = cfg.get("rungs") or {}
     entry = rungs.get(provider) or {}
     val = entry.get(key)
-    if val in (None, [], ""):
+    if val in (None, [], "") and provider == "nous":
         val = cfg.get(fallback_key)
     return val
 
@@ -459,10 +459,32 @@ def _log(rec):
             if warn:
                 _LOG_LAST_WARNING = now
         if warn:
+            stderr_handled = False
             try:
                 logger.warning("routing log failed for %s (%s; failures: %d)",
                                LOG_PATH, type(exc).__name__, failures)
+                # A stubbed warning emits nothing even when handlers are present.
+                native_warning = getattr(logger.warning, "__func__", None) is logging.Logger.warning
+                current = (logger if native_warning and logger.isEnabledFor(logging.WARNING)
+                           and not logger.filters else None)
+                handlers_found = False
+                while current:
+                    handlers_found = handlers_found or bool(current.handlers)
+                    if any(isinstance(handler, logging.StreamHandler)
+                           and handler.stream is sys.stderr
+                           and handler.level <= logging.WARNING and not handler.filters
+                           for handler in current.handlers):
+                        stderr_handled = True
+                        break
+                    current = current.parent if current.propagate else None
+                if native_warning and not handlers_found and logger.isEnabledFor(logging.WARNING) and not logger.filters:
+                    handler = logging.lastResort
+                    stderr_handled = (isinstance(handler, logging.StreamHandler)
+                                      and handler.stream is sys.stderr
+                                      and handler.level <= logging.WARNING and not handler.filters)
             except Exception:
+                pass  # a broken logger must not block the stderr fallback
+            if not stderr_handled:
                 try:
                     print("routing log failed for %s (%s; failures: %d)"
                           % (LOG_PATH, type(exc).__name__, failures), file=sys.stderr)

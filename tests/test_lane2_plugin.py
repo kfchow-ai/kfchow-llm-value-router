@@ -231,8 +231,7 @@ def test_rung_falls_back_to_flat_key():
     cfg = _cfg(mode="live")          # no 'rungs' -> flat premium_model used
     assert pl._rung(cfg, "nous", "premium", "premium_model") == \
         "anthropic/claude-sonnet-5.5"
-    assert pl._rung(cfg, "unknown-provider", "free", "free_model") == \
-        "inclusionai/ling-3.0-flash-sante:free"
+    assert pl._rung(cfg, "unknown-provider", "free", "free_model") is None
 
 
 # --------------------------------------------------------------- features
@@ -501,11 +500,7 @@ def test_log_failure_falls_back_to_stderr_without_prompt(monkeypatch, tmp_path, 
     monkeypatch.setattr(pl, "LOG_PATH", str(log))
     monkeypatch.setattr(pl, "_LOG_FAILURES", 0)
     monkeypatch.setattr(pl, "_LOG_LAST_WARNING", None)
-
-    def broken_warning(*args, **kwargs):
-        raise OSError("warning unavailable")
-
-    monkeypatch.setattr(pl.logger, "warning", broken_warning)
+    monkeypatch.setattr(pl.logger, "warning", lambda *args, **kwargs: None)
 
     pl._log({"task_excerpt": "SECRET_PROMPT_CANARY"})
     pl._log({"task_excerpt": "SECRET_PROMPT_CANARY"})
@@ -513,6 +508,53 @@ def test_log_failure_falls_back_to_stderr_without_prompt(monkeypatch, tmp_path, 
     assert err.count("routing log failed") == 1  # same rate limit as the warning
     assert str(log) in err
     assert "SECRET_PROMPT_CANARY" not in err
+
+
+@pytest.mark.parametrize("has_stderr_handler", [False, True])
+def test_log_failure_warns_when_logger_is_silent(monkeypatch, tmp_path, capsys,
+                                                has_stderr_handler):
+    log = tmp_path / "routing.jsonl"
+    log.mkdir()
+    handlers = [logging.StreamHandler(sys.stderr)] if has_stderr_handler else []
+    monkeypatch.setattr(pl, "LOG_PATH", str(log))
+    monkeypatch.setattr(pl, "_LOG_FAILURES", 0)
+    monkeypatch.setattr(pl, "_LOG_LAST_WARNING", None)
+    monkeypatch.setattr(pl.logger, "warning", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pl.logger, "handlers", handlers)
+    monkeypatch.setattr(pl.logger, "propagate", False)
+    monkeypatch.setattr(pl.logger, "level", logging.WARNING)
+    monkeypatch.setattr(pl.logger, "disabled", False)
+    monkeypatch.setattr(pl.logger, "filters", [])
+    pl._log({"task_excerpt": "SECRET_PROMPT_CANARY"})
+    err = capsys.readouterr().err
+    assert len(err.splitlines()) == 1
+    assert "routing log failed" in err and str(log) in err
+    assert "SECRET_PROMPT_CANARY" not in err
+    assert pl.get_log_failure_count() == 1
+
+
+def test_log_failure_falls_back_to_stderr_with_file_handler(monkeypatch, tmp_path, capsys):
+    log = tmp_path / "routing.jsonl"
+    log.mkdir()
+    warning_log = tmp_path / "warnings.log"
+    handler = logging.FileHandler(warning_log)
+    monkeypatch.setattr(pl, "LOG_PATH", str(log))
+    monkeypatch.setattr(pl, "_LOG_FAILURES", 0)
+    monkeypatch.setattr(pl, "_LOG_LAST_WARNING", None)
+    monkeypatch.setattr(pl.logger, "handlers", [handler])
+    monkeypatch.setattr(pl.logger, "propagate", False)
+    monkeypatch.setattr(pl.logger, "level", logging.WARNING)
+    try:
+        pl._log({"task_excerpt": "SECRET_PROMPT_CANARY"})
+        pl._log({"task_excerpt": "SECRET_PROMPT_CANARY"})
+    finally:
+        handler.close()
+    err = capsys.readouterr().err
+    assert len(err.splitlines()) == 1
+    assert "routing log failed" in err and str(log) in err
+    assert "SECRET_PROMPT_CANARY" not in err
+    assert "routing log failed" in warning_log.read_text()
+    assert pl.get_log_failure_count() == 2
 
 
 def test_log_failure_does_not_duplicate_real_stderr_handler(monkeypatch, tmp_path, capsys):
@@ -532,6 +574,92 @@ def test_log_failure_does_not_duplicate_real_stderr_handler(monkeypatch, tmp_pat
     assert pl.get_log_failure_count() == 2
 
 
+def test_log_failure_still_warns_when_stderr_handler_filters_warning(monkeypatch, tmp_path, capsys):
+    log = tmp_path / "routing.jsonl"
+    log.mkdir()
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setLevel(logging.ERROR)
+    monkeypatch.setattr(pl, "LOG_PATH", str(log))
+    monkeypatch.setattr(pl, "_LOG_FAILURES", 0)
+    monkeypatch.setattr(pl, "_LOG_LAST_WARNING", None)
+    monkeypatch.setattr(pl.logger, "handlers", [handler])
+    monkeypatch.setattr(pl.logger, "propagate", False)
+    monkeypatch.setattr(pl.logger, "level", logging.WARNING)
+    pl._log({"task_excerpt": "SECRET_PROMPT_CANARY"})
+    err = capsys.readouterr().err
+    assert len(err.splitlines()) == 1
+    assert "routing log failed" in err and str(log) in err
+    assert "SECRET_PROMPT_CANARY" not in err
+
+
+def test_log_failure_still_warns_when_logger_is_disabled(monkeypatch, tmp_path, capsys):
+    log = tmp_path / "routing.jsonl"
+    log.mkdir()
+    monkeypatch.setattr(pl, "LOG_PATH", str(log))
+    monkeypatch.setattr(pl, "_LOG_FAILURES", 0)
+    monkeypatch.setattr(pl, "_LOG_LAST_WARNING", None)
+    monkeypatch.setattr(pl.logger, "handlers", [logging.StreamHandler(sys.stderr)])
+    monkeypatch.setattr(pl.logger, "propagate", False)
+    monkeypatch.setattr(pl.logger, "disabled", True)
+    pl._log({"task_excerpt": "SECRET_PROMPT_CANARY"})
+    err = capsys.readouterr().err
+    assert len(err.splitlines()) == 1
+    assert "routing log failed" in err and str(log) in err
+    assert "SECRET_PROMPT_CANARY" not in err
+
+
+def test_log_failure_still_warns_when_logger_filter_rejects(monkeypatch, tmp_path, capsys):
+    log = tmp_path / "routing.jsonl"
+    log.mkdir()
+    monkeypatch.setattr(pl, "LOG_PATH", str(log))
+    monkeypatch.setattr(pl, "_LOG_FAILURES", 0)
+    monkeypatch.setattr(pl, "_LOG_LAST_WARNING", None)
+    monkeypatch.setattr(pl.logger, "handlers", [logging.StreamHandler(sys.stderr)])
+    monkeypatch.setattr(pl.logger, "filters", [lambda record: False])
+    monkeypatch.setattr(pl.logger, "propagate", False)
+    monkeypatch.setattr(pl.logger, "level", logging.WARNING)
+    pl._log({"task_excerpt": "SECRET_PROMPT_CANARY"})
+    err = capsys.readouterr().err
+    assert len(err.splitlines()) == 1
+    assert "routing log failed" in err and str(log) in err
+    assert "SECRET_PROMPT_CANARY" not in err
+
+
+def test_log_failure_does_not_duplicate_propagated_stderr_handler(monkeypatch, tmp_path, capsys):
+    log = tmp_path / "routing.jsonl"
+    log.mkdir()
+    monkeypatch.setattr(pl, "LOG_PATH", str(log))
+    monkeypatch.setattr(pl, "_LOG_FAILURES", 0)
+    monkeypatch.setattr(pl, "_LOG_LAST_WARNING", None)
+    monkeypatch.setattr(pl.logger, "handlers", [])
+    monkeypatch.setattr(pl.logger, "propagate", True)
+    monkeypatch.setattr(pl.logger, "level", logging.WARNING)
+    monkeypatch.setattr(logging.root, "handlers", [logging.StreamHandler(sys.stderr)])
+    pl._log({"task_excerpt": "SECRET_PROMPT_CANARY"})
+    pl._log({"task_excerpt": "SECRET_PROMPT_CANARY"})
+    err = capsys.readouterr().err
+    assert len(err.splitlines()) == 1
+    assert "routing log failed" in err and str(log) in err
+    assert "SECRET_PROMPT_CANARY" not in err
+    assert pl.get_log_failure_count() == 2
+
+
+def test_log_failure_does_not_duplicate_last_resort_stderr(monkeypatch, tmp_path, capsys):
+    log = tmp_path / "routing.jsonl"
+    log.mkdir()
+    monkeypatch.setattr(pl, "LOG_PATH", str(log))
+    monkeypatch.setattr(pl, "_LOG_FAILURES", 0)
+    monkeypatch.setattr(pl, "_LOG_LAST_WARNING", None)
+    monkeypatch.setattr(pl.logger, "handlers", [])
+    monkeypatch.setattr(pl.logger, "propagate", False)
+    monkeypatch.setattr(pl.logger, "level", logging.WARNING)
+    pl._log({"task_excerpt": "SECRET_PROMPT_CANARY"})
+    err = capsys.readouterr().err
+    assert len(err.splitlines()) == 1
+    assert "routing log failed" in err and str(log) in err
+    assert "SECRET_PROMPT_CANARY" not in err
+
+
 def test_log_falls_back_to_stderr_when_warning_handler_fails(monkeypatch, tmp_path, capsys):
     log = tmp_path / "routing.jsonl"
     log.mkdir()
@@ -547,6 +675,49 @@ def test_log_falls_back_to_stderr_when_warning_handler_fails(monkeypatch, tmp_pa
     monkeypatch.setattr(pl.logger, "propagate", False)
     pl._log({"task_excerpt": "SECRET_PROMPT_CANARY"})
     err = capsys.readouterr().err
+    assert "routing log failed" in err and str(log) in err
+    assert "SECRET_PROMPT_CANARY" not in err
+    assert pl.get_log_failure_count() == 1
+
+
+def test_log_falls_back_when_warning_raises_with_null_handler(monkeypatch, tmp_path, capsys):
+    log = tmp_path / "routing.jsonl"
+    log.mkdir()
+    monkeypatch.setattr(pl, "LOG_PATH", str(log))
+    monkeypatch.setattr(pl, "_LOG_FAILURES", 0)
+    monkeypatch.setattr(pl, "_LOG_LAST_WARNING", None)
+    monkeypatch.setattr(pl.logger, "handlers", [logging.NullHandler()])
+    monkeypatch.setattr(pl.logger, "propagate", False)
+    monkeypatch.setattr(pl.logger, "level", logging.WARNING)
+
+    def broken_warning(*args, **kwargs):
+        raise OSError("warning unavailable")
+
+    monkeypatch.setattr(pl.logger, "warning", broken_warning)
+    pl._log({"task_excerpt": "SECRET_PROMPT_CANARY"})
+    err = capsys.readouterr().err
+    assert len(err.splitlines()) == 1
+    assert "routing log failed" in err and str(log) in err
+    assert "SECRET_PROMPT_CANARY" not in err
+    assert pl.get_log_failure_count() == 1
+
+
+def test_log_falls_back_when_warning_raises_with_stderr_handler(monkeypatch, tmp_path, capsys):
+    log = tmp_path / "routing.jsonl"
+    log.mkdir()
+    monkeypatch.setattr(pl, "LOG_PATH", str(log))
+    monkeypatch.setattr(pl, "_LOG_FAILURES", 0)
+    monkeypatch.setattr(pl, "_LOG_LAST_WARNING", None)
+    monkeypatch.setattr(pl.logger, "handlers", [logging.StreamHandler(sys.stderr)])
+    monkeypatch.setattr(pl.logger, "propagate", False)
+
+    def broken_warning(*args, **kwargs):
+        raise OSError("warning unavailable")
+
+    monkeypatch.setattr(pl.logger, "warning", broken_warning)
+    pl._log({"task_excerpt": "SECRET_PROMPT_CANARY"})
+    err = capsys.readouterr().err
+    assert len(err.splitlines()) == 1
     assert "routing log failed" in err and str(log) in err
     assert "SECRET_PROMPT_CANARY" not in err
     assert pl.get_log_failure_count() == 1
@@ -573,11 +744,7 @@ def test_log_fails_open_when_stderr_is_unavailable(monkeypatch, tmp_path):
     monkeypatch.setattr(pl, "LOG_PATH", str(log))
     monkeypatch.setattr(pl, "_LOG_FAILURES", 0)
     monkeypatch.setattr(pl, "_LOG_LAST_WARNING", None)
-
-    def broken_warning(*args, **kwargs):
-        raise OSError("warning unavailable")
-
-    monkeypatch.setattr(pl.logger, "warning", broken_warning)
+    monkeypatch.setattr(pl.logger, "warning", lambda *args, **kwargs: None)
 
     class BrokenStderr:
         def write(self, text):
@@ -909,6 +1076,45 @@ def test_error_hook_skips_empty_rungs(monkeypatch):
     _reset_decisions()
     pl.on_api_request_error(**_err_kwargs(_LING, 429))
     assert pl._session_override("s1") == _cfg7()["premium_model"]
+
+
+def test_opencode_429_cannot_arm_or_rewrite_using_flat_nous_rungs(monkeypatch):
+    cfg = _cfg7(rungs={}, route_providers=["opencode-go"],
+                escalate_providers=["opencode-go"])
+    recs = []
+    monkeypatch.setattr(pl, "_load_config", lambda: cfg)
+    monkeypatch.setattr(pl, "_log", recs.append)
+    _reset_decisions()
+    kw = _kwargs(provider="opencode-go", model="opencode-free", api_call_count=2)
+    before = dict(kw["request"])
+    pl.on_api_request_error(status_code=429, provider="opencode-go", session_id="s1",
+                            request={"method": "POST", "body": kw["request"]})
+    out = pl.on_llm_request(**kw)
+    seen = []
+    context = {key: value for key, value in kw.items() if key != "request"}
+    pl.on_llm_execution(request=kw["request"], next_call=seen.append, **context)
+    assert pl._session_override("s1") is None
+    assert not any(row.get("skip_reason") == "error_override_armed" for row in recs)
+    assert out is None
+    assert seen == [before] and seen[0] is kw["request"]
+    assert kw["request"] == before
+
+
+def test_flat_nous_rungs_do_not_trigger_other_provider_routing(monkeypatch):
+    cfg = _cfg7(rungs={}, route_providers=["opencode-go"],
+                escalate_providers=["opencode-go"])
+    classified, recs = [], []
+    monkeypatch.setattr(pl, "_load_config", lambda: cfg)
+    monkeypatch.setattr(pl, "_classify",
+                        lambda feats, config: classified.append(1) or ("free", 0.50))
+    monkeypatch.setattr(pl, "_log", recs.append)
+    _reset_decisions()
+    kw = _kwargs(provider="opencode-go", model="opencode-paid")
+    before = dict(kw["request"])
+    assert pl.on_llm_request(**kw) is None
+    assert kw["request"] == before
+    assert classified == []
+    assert recs[-1]["skip_reason"] == "no_rungs_configured"
 
 
 def test_error_override_rewrites_next_request(monkeypatch):
@@ -1460,7 +1666,10 @@ def test_armed_override_never_crosses_providers(monkeypatch, armed_provider, fai
 @pytest.mark.parametrize("hook", ["request", "execution"])
 def test_override_without_arming_provider_is_inert(monkeypatch, hook):
     recs = []
-    monkeypatch.setattr(pl, "_load_config", lambda: _cfg7(mode="live"))
+    # A missing provider may still have an explicitly configured ladder; its
+    # override must remain inert for any provider-scoped request (D2).
+    cfg = _cfg7(mode="live", rungs={"": {"free": _LING, "flash": _FLASH}})
+    monkeypatch.setattr(pl, "_load_config", lambda: cfg)
     monkeypatch.setattr(pl, "_log", recs.append)
     _reset_decisions()
     pl.on_api_request_error(status_code=429, session_id="s1",
