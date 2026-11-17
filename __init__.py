@@ -421,19 +421,40 @@ def _kill_switch_off(request):
     return False
 
 
+_LOG_FAILURES = 0
+_LOG_LAST_WARNING = None
+_LOG_FAILURE_LOCK = threading.Lock()
+
+
 def _log(rec):
+    global _LOG_FAILURES, _LOG_LAST_WARNING
     try:
-        os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
-        with open(LOG_PATH, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(rec) + "\n")
-        # Decision logs may carry task text (send_excerpt) or route metadata;
-        # restrict them to the owner only.
+        directory = os.path.dirname(LOG_PATH)
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        os.chmod(directory, 0o700)
+        fd = os.open(LOG_PATH, os.O_APPEND | os.O_CREAT | os.O_WRONLY
+                     | getattr(os, "O_NOFOLLOW", 0), 0o600)
         try:
-            os.chmod(LOG_PATH, 0o600)
-        except OSError:
-            pass
-    except Exception:
-        pass  # telemetry must never break a turn
+            fh = os.fdopen(fd, "a", encoding="utf-8")
+        except Exception:
+            os.close(fd)
+            raise
+        with fh:
+            # Existing logs may have been created insecurely by an older version.
+            os.fchmod(fh.fileno(), 0o600)
+            fh.write(json.dumps(rec) + "\n")
+    except Exception as exc:
+        # Telemetry must not break a turn, but failures must not be silent.
+        with _LOG_FAILURE_LOCK:
+            _LOG_FAILURES += 1
+            failures = _LOG_FAILURES
+            now = time.monotonic()
+            warn = _LOG_LAST_WARNING is None or now - _LOG_LAST_WARNING >= 60
+            if warn:
+                _LOG_LAST_WARNING = now
+        if warn:
+            logger.warning("routing log failed for %s (%s; failures: %d)",
+                           LOG_PATH, type(exc).__name__, failures)
 
 
 def _features(request, excerpt_chars=1200, include_excerpt=True):
@@ -533,8 +554,10 @@ def on_api_request_error(**kwargs):
         status = kwargs.get("status_code")
         if status not in (401, 404, 429):
             return
-        request = ((kwargs.get("api_kwargs") or {}).get("body")) or {}
-        model = str(request.get("model") or "")
+        envelope = kwargs.get("request") or kwargs.get("api_kwargs") or {}
+        body = envelope.get("body") if isinstance(envelope, dict) else None
+        model = str((body.get("model") if isinstance(body, dict) else None)
+                    or kwargs.get("model") or "")
         provider = str(kwargs.get("provider") or "")
         if not model:
             return

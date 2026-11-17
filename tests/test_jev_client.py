@@ -4,8 +4,10 @@ Offline tests use the `transport` seam; no network, no key file needed.
 There are deliberately NO live-marked tests in the repo: the suite must run
 green on any machine with no keys and no network.
 """
+import builtins
 import json
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -48,7 +50,82 @@ def ok_response(payload):
 def test_load_api_key_skips_comment_lines(tmp_path):
     p = tmp_path / "creds"
     p.write_text("SK-TEST-123\n# this is a comment\n")
+    p.chmod(0o600)
     assert jc.load_api_key(str(p), env_var="JEVI_API_KEY_UNUSED_BY_TEST") == "SK-TEST-123"
+
+
+@pytest.mark.parametrize("mode", [0o004, 0o640, 0o604, 0o601, 0o666])
+def test_load_api_key_refuses_group_or_world_permissions(tmp_path, mode):
+    p = tmp_path / "creds"
+    p.write_text("SECRET_KEY_CANARY\n")
+    p.chmod(mode)
+    with pytest.raises(jc.JevError) as exc:
+        jc.load_api_key(str(p), env_var="JEVI_API_KEY_UNUSED_BY_TEST")
+    assert str(p) in str(exc.value)
+    assert oct(mode) in str(exc.value)
+    assert "SECRET_KEY_CANARY" not in str(exc.value)
+
+
+def test_load_api_key_rejects_wrong_owner(monkeypatch, tmp_path):
+    p = tmp_path / "creds"
+    p.write_text("SECRET_KEY_CANARY\n")
+    p.chmod(0o600)
+    real_stat = os.stat
+
+    def other_owner(path, *args, **kwargs):
+        result = real_stat(path, *args, **kwargs)
+        if os.fspath(path) == str(p):
+            return SimpleNamespace(st_mode=result.st_mode, st_uid=os.getuid() + 1)
+        return result
+
+    monkeypatch.setattr(jc.os, "stat", other_owner)
+    with pytest.raises(jc.JevError) as exc:
+        jc.load_api_key(str(p), env_var="JEVI_API_KEY_UNUSED_BY_TEST")
+    assert str(p) in str(exc.value)
+    assert "0o600" in str(exc.value)
+    assert "owner" in str(exc.value).lower()
+    assert "SECRET_KEY_CANARY" not in str(exc.value)
+
+
+def test_load_api_key_checks_opened_file_after_path_swap(monkeypatch, tmp_path):
+    p, swapped = tmp_path / "creds", tmp_path / "swapped"
+    p.write_text("SAFE\n")
+    p.chmod(0o600)
+    swapped.write_text("SECRET_KEY_CANARY\n")
+    swapped.chmod(0o644)
+    real_open = builtins.open
+
+    def open_swapped(path, *args, **kwargs):
+        if os.fspath(path) == str(p):
+            return real_open(swapped, *args, **kwargs)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", open_swapped)
+    with pytest.raises(jc.JevError) as exc:
+        jc.load_api_key(str(p), env_var="JEVI_API_KEY_UNUSED_BY_TEST")
+    assert str(p) in str(exc.value) and "0o644" in str(exc.value)
+    assert "SECRET_KEY_CANARY" not in str(exc.value)
+
+
+def test_load_api_key_checks_opened_file_owner(monkeypatch, tmp_path):
+    p = tmp_path / "creds"
+    p.write_text("SECRET_KEY_CANARY\n")
+    p.chmod(0o600)
+    inode = p.stat().st_ino
+    real_fstat = os.fstat
+
+    def other_owner(fd):
+        result = real_fstat(fd)
+        if result.st_ino == inode:
+            return SimpleNamespace(st_mode=result.st_mode, st_uid=os.getuid() + 1)
+        return result
+
+    monkeypatch.setattr(jc.os, "fstat", other_owner)
+    with pytest.raises(jc.JevError) as exc:
+        jc.load_api_key(str(p), env_var="JEVI_API_KEY_UNUSED_BY_TEST")
+    assert str(p) in str(exc.value) and "0o600" in str(exc.value)
+    assert "owner" in str(exc.value).lower()
+    assert "SECRET_KEY_CANARY" not in str(exc.value)
 
 
 def test_load_api_key_env_first(monkeypatch):

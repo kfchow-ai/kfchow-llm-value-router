@@ -24,6 +24,7 @@ Stdlib only (urllib.request). Python 3.9+.
 import json
 import os
 import socket
+import stat
 import time
 import urllib.error
 import urllib.request
@@ -82,12 +83,26 @@ def load_api_key(path=None, env_var="JEVI_API_KEY"):
         os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")),
         "secrets", "jev.creds")
     try:
+        st = os.stat(path)
+        mode = stat.S_IMODE(st.st_mode)
+        if mode & 0o077 or st.st_uid != os.getuid():
+            raise JevError(
+                "unsafe creds file %s: mode %s, owner uid %s; "
+                "require owner uid %s and no group/other permissions"
+                % (path, oct(mode), st.st_uid, os.getuid()))
         fh = open(path, "r", encoding="utf-8")
     except OSError as exc:
         raise JevError(
             "no API key: set %s or provide a creds file at %s (%s)"
             % (env_var, path, exc.__class__.__name__))
     with fh:
+        st = os.fstat(fh.fileno())
+        mode = stat.S_IMODE(st.st_mode)
+        if mode & 0o077 or st.st_uid != os.getuid():
+            raise JevError(
+                "unsafe creds file %s: mode %s, owner uid %s; "
+                "require owner uid %s and no group/other permissions"
+                % (path, oct(mode), st.st_uid, os.getuid()))
         for line in fh:
             stripped = line.strip()
             if stripped and not stripped.startswith("#"):
