@@ -495,6 +495,75 @@ def test_log_failure_is_counted_and_rate_limited(monkeypatch, tmp_path, caplog, 
     assert not log.exists() or not log.read_text()
 
 
+def test_log_failure_falls_back_to_stderr_without_prompt(monkeypatch, tmp_path, capsys):
+    log = tmp_path / "routing.jsonl"
+    log.mkdir()  # opening a directory as a file fails without special privileges
+    monkeypatch.setattr(pl, "LOG_PATH", str(log))
+    monkeypatch.setattr(pl, "_LOG_FAILURES", 0)
+    monkeypatch.setattr(pl, "_LOG_LAST_WARNING", None)
+    monkeypatch.setattr(pl.logger, "warning", lambda *args, **kwargs: None)
+
+    pl._log({"task_excerpt": "SECRET_PROMPT_CANARY"})
+    pl._log({"task_excerpt": "SECRET_PROMPT_CANARY"})
+    err = capsys.readouterr().err
+    assert err.count("routing log failed") == 1  # same rate limit as the warning
+    assert str(log) in err
+    assert "SECRET_PROMPT_CANARY" not in err
+
+
+def test_log_falls_back_to_stderr_when_warning_handler_fails(monkeypatch, tmp_path, capsys):
+    log = tmp_path / "routing.jsonl"
+    log.mkdir()
+    monkeypatch.setattr(pl, "LOG_PATH", str(log))
+    monkeypatch.setattr(pl, "_LOG_FAILURES", 0)
+    monkeypatch.setattr(pl, "_LOG_LAST_WARNING", None)
+
+    class BrokenHandler(logging.Handler):
+        def emit(self, record):
+            raise OSError("warning handler unavailable")
+
+    monkeypatch.setattr(pl.logger, "handlers", [BrokenHandler()])
+    monkeypatch.setattr(pl.logger, "propagate", False)
+    pl._log({"task_excerpt": "SECRET_PROMPT_CANARY"})
+    err = capsys.readouterr().err
+    assert "routing log failed" in err and str(log) in err
+    assert "SECRET_PROMPT_CANARY" not in err
+    assert pl.get_log_failure_count() == 1
+
+
+def test_log_failure_counter_has_public_accessor(monkeypatch, tmp_path):
+    log = tmp_path / "routing.jsonl"
+    log.mkdir()
+    monkeypatch.setattr(pl, "LOG_PATH", str(log))
+    monkeypatch.setattr(pl, "_LOG_FAILURES", 0)
+    monkeypatch.setattr(pl, "_LOG_LAST_WARNING", None)
+    accessor = getattr(pl, "get_log_failure_count", None)
+    assert callable(accessor)
+    assert accessor() == 0
+
+    pl._log({"event": "first"})
+    pl._log({"event": "second"})
+    assert accessor() == 2
+
+
+def test_log_fails_open_when_stderr_is_unavailable(monkeypatch, tmp_path):
+    log = tmp_path / "routing.jsonl"
+    log.mkdir()
+    monkeypatch.setattr(pl, "LOG_PATH", str(log))
+    monkeypatch.setattr(pl, "_LOG_FAILURES", 0)
+    monkeypatch.setattr(pl, "_LOG_LAST_WARNING", None)
+    monkeypatch.setattr(pl.logger, "warning", lambda *args, **kwargs: None)
+
+    class BrokenStderr:
+        def write(self, text):
+            raise OSError("stderr unavailable")
+
+    monkeypatch.setattr(sys, "stderr", BrokenStderr())
+    pl._log({"event": "first"})  # audit failure must not fail the turn
+    accessor = getattr(pl, "get_log_failure_count", None)
+    assert callable(accessor) and accessor() == 1
+
+
 def test_existing_log_is_not_written_when_hardening_fails(monkeypatch, tmp_path, caplog):
     log = tmp_path / "jev" / "routing.jsonl"
     log.parent.mkdir()
@@ -823,10 +892,58 @@ def test_error_override_rewrites_next_request(monkeypatch):
     monkeypatch.setattr(pl, "_log", recs.append)
     _reset_decisions()
     pl.on_api_request_error(**_err_kwargs(_LING, 429))
-    out = pl.on_llm_request(**_kwargs(model=_LING, turn_id="after-err"))
-    assert out == {"request": {"model": _FLASH}}
+    kw = _kwargs(model=_LING, turn_id="after-err")
+    out = pl.on_llm_request(**kw)
+    assert out == {"request": {**kw["request"], "model": _FLASH}}
     assert recs[-1]["skip_reason"] == "error_override_applied"
     assert recs[-1]["applied"] is True          # live mode
+
+
+def test_armed_error_override_preserves_every_request_field(monkeypatch):
+    monkeypatch.setattr(pl, "_load_config", lambda: _cfg7(mode="live"))
+    monkeypatch.setattr(pl, "_log", lambda rec: None)
+    _reset_decisions()
+    pl.on_api_request_error(status_code=429, provider="nous", session_id="s1",
+                            request={"method": "POST", "body": {"model": _LING}})
+    assert pl._session_override("s1") == _FLASH
+
+    messages = [{"role": "user", "content": "find it"},
+                {"role": "assistant", "content": None, "tool_calls": []}]
+    tools = [{"type": "function", "function": {"name": "lookup", "parameters": {}}}]
+    opaque = object()  # provider kwargs can contain non-JSON client objects
+    request = {"model": _LING, "messages": messages, "tools": tools,
+               "tool_choice": "auto", "temperature": 0.25, "stream": False,
+               "metadata": {"trace": "kept"}, "future_option": opaque}
+    kw = _kwargs(model=_LING, turn_id="payload-after-err")
+    kw["request"] = request
+    out = pl.on_llm_request(**kw)
+    assert out == {"request": {**request, "model": _FLASH}}
+    assert out["request"] is not request
+    assert request["model"] == _LING
+    assert out["request"]["messages"] == messages
+    assert out["request"]["tools"] == tools
+    assert out["request"]["future_option"] is opaque
+
+
+@pytest.mark.parametrize("mode", ["shadow", "SHADOW", "bogus", None])
+def test_armed_error_override_never_rewrites_outside_live_mode(monkeypatch, mode):
+    cfg = _cfg7(mode=mode)
+    if mode is None:
+        cfg.pop("mode")  # absent mode defaults to shadow
+    recs = []
+    monkeypatch.setattr(pl, "_load_config", lambda: cfg)
+    monkeypatch.setattr(pl, "_classify", lambda features, config: ("free", 0.50))
+    monkeypatch.setattr(pl, "_log", recs.append)
+    _reset_decisions()
+    pl.on_api_request_error(status_code=429, provider="nous", session_id="s1",
+                            request={"method": "POST", "body": {"model": _LING}})
+    assert pl._session_override("s1") == _FLASH
+    kw = _kwargs(model=_LING, turn_id="shadow-after-err")
+    kw["request"]["tools"] = [{"type": "function", "function": {"name": "lookup"}}]
+    before = json.loads(json.dumps(kw["request"]))
+    assert pl.on_llm_request(**kw) is None
+    assert kw["request"] == before
+    assert not any(row.get("applied") for row in recs)
 
 
 def test_error_override_expires(monkeypatch):

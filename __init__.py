@@ -426,6 +426,12 @@ _LOG_LAST_WARNING = None
 _LOG_FAILURE_LOCK = threading.Lock()
 
 
+def get_log_failure_count():
+    """Return the number of routing-log failures in this process."""
+    with _LOG_FAILURE_LOCK:
+        return _LOG_FAILURES
+
+
 def _log(rec):
     global _LOG_FAILURES, _LOG_LAST_WARNING
     try:
@@ -453,8 +459,16 @@ def _log(rec):
             if warn:
                 _LOG_LAST_WARNING = now
         if warn:
-            logger.warning("routing log failed for %s (%s; failures: %d)",
-                           LOG_PATH, type(exc).__name__, failures)
+            try:
+                logger.warning("routing log failed for %s (%s; failures: %d)",
+                               LOG_PATH, type(exc).__name__, failures)
+            except Exception:
+                pass  # a broken logging handler must not block the stderr fallback
+            try:
+                print("routing log failed for %s (%s; failures: %d)"
+                      % (LOG_PATH, type(exc).__name__, failures), file=sys.stderr)
+            except Exception:
+                pass  # stderr may also be unavailable; never break the turn
 
 
 def _features(request, excerpt_chars=1200, include_excerpt=True):
@@ -637,14 +651,15 @@ def on_llm_request(**kwargs):
         # chose. Wins over the decision cache: the turn must not stop, and the
         # next request is served on the next live rung.
         forced = _session_override(session_id)
-        if forced and not _same_model(forced, model):
+        if (forced and str(cfg.get("mode", "shadow")).lower() == "live"
+                and not _same_model(forced, model)):
             _log({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "turn_id": turn_id,
                   "session_id": session_id, "provider": provider, "model": model,
                   "pool": None, "confidence": None, "gate": None, "eligible": False,
                   "mode": str(cfg.get("mode", "shadow")).lower(),
-                  "applied": str(cfg.get("mode", "shadow")).lower() == "live",
+                  "applied": True,
                   "skip_reason": "error_override_applied", "override_target": forced})
-            return {"request": {"model": forced}}
+            return {"request": {**request, "model": forced}}
 
         # ---- TURN DECISION CACHE (P1) ------------------------------------
         # The host re-runs this middleware on every attempt of the turn
