@@ -593,11 +593,11 @@ def on_api_request_error(**kwargs):
             return
         envelope = kwargs.get("request") or kwargs.get("api_kwargs") or {}
         body = envelope.get("body") if isinstance(envelope, dict) else None
-        model = str((body.get("model") if isinstance(body, dict) else None)
-                    or kwargs.get("model") or "")
-        provider = str(kwargs.get("provider") or "")
-        if not model:
+        # Configured kwargs.model may differ from the failed request's model.
+        model = body.get("model") if isinstance(body, dict) else None
+        if not isinstance(model, str) or not model.strip():
             return
+        provider = str(kwargs.get("provider") or "")
         cfg = _load_config()
         rung_models = {k: _rung(cfg, provider, k, k + "_model") for k in _ERROR_RUNGS}
         # Which rung failed? Match by id, else fall back to "below free".

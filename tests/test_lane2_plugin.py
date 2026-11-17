@@ -14,6 +14,8 @@ import logging
 import os
 import stat
 import sys
+import time
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -1037,14 +1039,124 @@ def test_error_hook_arms_from_host_request_envelope(monkeypatch, status):
     assert recs[-1]["error_status"] == status
 
 
-def test_error_hook_falls_back_to_top_level_model(monkeypatch):
+@pytest.mark.parametrize("failed_model, agent_model", [
+    pytest.param(_LING, _SONNET, id="trunc_failing_free"),
+    pytest.param(_FLASH, _SONNET, id="trunc_failing_flash"),
+    pytest.param(_MID, _SONNET, id="trunc_failing_mid"),
+    pytest.param(_LING, "openai/gpt-6.1-terra", id="trunc_agent_model_is_premium"),
+    pytest.param(_LING, "", id="trunc_agent_model_empty"),
+])
+def test_truncated_error_does_not_arm_from_configured_model(monkeypatch, failed_model, agent_model):
+    # The truncated preview does not identify the model that failed.
+    rungs = {"free": _LING, "flash": _FLASH, "mid": _MID,
+             "premium": "openai/gpt-6.1-terra"}
+    cfg = _cfg7(rungs={"nous": rungs})
+    recs = []
+    monkeypatch.setattr(pl, "_load_config", lambda: cfg)
+    monkeypatch.setattr(pl, "_log", recs.append)
+    envelope = {"_truncated": True, "original_type": "dict",
+                "preview": '{"method": "POST", "body": {"model": "..."}}'}
+
+    # A configured model is never a substitute for the missing failed model.
+    for configured in (agent_model, _SONNET):
+        _reset_decisions()
+        recs.clear()
+        pl.on_api_request_error(status_code=429, provider="nous", session_id="s1",
+                                turn_id="e1", model=configured, request=envelope)
+        assert pl._session_override("s1") is None
+        assert recs == []
+
+        # With no error override, neither middleware may rewrite this retry.
+        kw = _kwargs(model=failed_model, api_call_count=2, turn_id="e1")
+        before = dict(kw["request"])
+        assert pl.on_llm_request(**kw) is None
+        seen = []
+        context = {key: value for key, value in kw.items() if key != "request"}
+        pl.on_llm_execution(request=kw["request"], next_call=seen.append, **context)
+        assert seen == [before] and kw["request"] == before
+
+
+_MALFORMED_ERROR_ENVELOPES = [
+    None, {}, {"method": "POST"}, {"body": {}}, {"body": {"model": None}},
+    {"body": {"model": ""}}, {"body": {"model": "   "}},
+    {"body": {"model": 42}}, {"body": {"model": True}},
+    {"body": {"model": ["fake-model"]}}, {"body": {"model": {}}},
+    {"body": "not-a-dict"}, "not-a-dict",
+    {"body": {"model": b"x"}},
+]
+
+
+@pytest.mark.parametrize("envelope", _MALFORMED_ERROR_ENVELOPES)
+def test_error_hook_missing_body_model_fails_open(monkeypatch, envelope):
     monkeypatch.setattr(pl, "_load_config", lambda: _cfg7())
     monkeypatch.setattr(pl, "_log", lambda rec: None)
     _reset_decisions()
     pl.on_api_request_error(status_code=429, session_id="host-session",
-                            provider="nous", model=_LING,
-                            request={"method": "POST", "body": {}})
-    assert pl._session_override("host-session") == _FLASH
+                            provider="nous", model=_LING, request=envelope)
+    assert pl._session_override("host-session") is None
+
+
+def _spy_session_override(monkeypatch):
+    real = pl._SESSION_OVERRIDE
+    spy = MagicMock(spec_set=type(real), wraps=real)
+    # MagicMock does not forward magic methods through wraps by default.
+    for name in ("__getitem__", "__setitem__", "__delitem__", "__len__",
+                 "__iter__", "__contains__", "__ior__"):
+        getattr(spy, name).side_effect = getattr(real, name)
+    monkeypatch.setattr(pl, "_SESSION_OVERRIDE", spy)
+    return spy
+
+
+# Truncated, missing envelope/body/model, blank/whitespace, and non-string
+# shapes are sampled; the whole-hook spy, not this list, enforces non-mutation
+# for each sampled envelope. No finite list covers every conceivable shape.
+@pytest.mark.parametrize("envelope", [
+    {"_truncated": True, "original_type": "dict",
+     "preview": '{"method": "POST", "body": {"model": "%s"}}' % _FLASH},
+    *_MALFORMED_ERROR_ENVELOPES,
+], ids=["truncated_with_model_in_preview", "none", "empty_envelope", "method_only",
+        "empty_body", "none_model", "empty_str_model", "whitespace_model",
+        "int_model", "bool_model", "list_model", "dict_model", "body_not_dict",
+        "envelope_not_dict", "bytes_model"])
+def test_missing_body_model_keeps_existing_override(monkeypatch, envelope):
+    premium = "openai/gpt-6.1-terra"
+    cfg = _cfg7(rungs={"nous": {"free": _LING, "flash": _FLASH,
+                                "mid": _MID, "premium": premium}})
+    monkeypatch.setattr(pl, "_load_config", lambda: cfg)
+    monkeypatch.setattr(pl, "_log", lambda rec: None)
+    _reset_decisions()
+    previous = {"model": premium, "provider": "nous", "ts": time.monotonic()}
+    with pl._SESSION_OVERRIDE_LOCK:
+        pl._SESSION_OVERRIDE["s-keep"] = dict(previous)
+    try:
+        assert pl._session_override("s-keep", "nous") == premium
+        with monkeypatch.context() as guard:
+            overrides = _spy_session_override(guard)
+            pl.on_api_request_error(status_code=429, provider="nous", session_id="s-keep",
+                                    turn_id="t-keep", model=_SONNET, request=envelope)
+        mutations = {"__setitem__", "__delitem__", "__ior__", "clear", "move_to_end",
+                     "pop", "popitem", "setdefault", "update"}
+        assert not [call for call in overrides.mock_calls if call[0] in mutations]
+        assert pl._session_override("s-keep", "nous") == premium
+        with pl._SESSION_OVERRIDE_LOCK:
+            assert pl._SESSION_OVERRIDE["s-keep"] == previous
+    finally:
+        _reset_decisions()
+
+
+def test_error_hook_mutation_spy_observes_valid_model(monkeypatch):
+    monkeypatch.setattr(pl, "_load_config", lambda: _cfg7())
+    monkeypatch.setattr(pl, "_log", lambda rec: None)
+    _reset_decisions()
+    try:
+        with monkeypatch.context() as guard:
+            overrides = _spy_session_override(guard)
+            pl.on_api_request_error(**_err_kwargs(_LING, 429))
+        overrides.__setitem__.assert_called_once()
+        overrides.move_to_end.assert_called_once_with("s1")
+        assert pl._session_override("s1", "nous") == _FLASH
+    finally:
+        _reset_decisions()
 
 
 @pytest.mark.parametrize("status", [401, 404, 429])
