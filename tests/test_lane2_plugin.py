@@ -6,11 +6,13 @@ real turn. Run with a throwaway HOME so nothing here can touch a real config:
 
     HOME=$(mktemp -d) PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest -q
 """
+import builtins
 import importlib.machinery
 import importlib.util
 import json
 import logging
 import os
+import stat
 import sys
 
 import pytest
@@ -418,6 +420,120 @@ def test_hermes_home_bases_paths(monkeypatch):
     assert "not in src" or ("/Us" + "ers/" not in src and "/ho" + "me/" not in src)
 
 
+def test_log_is_private_at_creation(monkeypatch, tmp_path):
+    log = tmp_path / "jev" / "routing.jsonl"
+    monkeypatch.setattr(pl, "LOG_PATH", str(log))
+    opened = []
+    builtin_open, os_open = builtins.open, os.open
+
+    def record(fd):
+        opened.append((stat.S_IMODE(os.fstat(fd).st_mode),
+                       stat.S_IMODE(os.stat(log.parent).st_mode)))
+
+    def watch_builtin(path, *args, **kwargs):
+        fh = builtin_open(path, *args, **kwargs)
+        if isinstance(path, (str, os.PathLike)) and os.fspath(path) == str(log):
+            record(fh.fileno())
+        return fh
+
+    def watch_os_open(path, flags, mode=0o777, **kwargs):
+        fd = os_open(path, flags, mode, **kwargs)
+        if os.fspath(path) == str(log):
+            record(fd)
+        return fd
+
+    monkeypatch.setattr(builtins, "open", watch_builtin)
+    monkeypatch.setattr(os, "open", watch_os_open)
+    old_umask = os.umask(0)
+    try:
+        pl._log({"task_excerpt": "private"})
+    finally:
+        os.umask(old_umask)
+    assert opened == [(0o600, 0o700)]
+    assert json.loads(log.read_text()) == {"task_excerpt": "private"}
+
+
+@pytest.mark.parametrize("failure", ["chmod", "write"])
+def test_log_failure_is_counted_and_rate_limited(monkeypatch, tmp_path, caplog, failure):
+    log = tmp_path / "jev" / "routing.jsonl"
+    monkeypatch.setattr(pl, "LOG_PATH", str(log))
+    monkeypatch.setattr(pl, "_LOG_FAILURES", 0, raising=False)
+    monkeypatch.setattr(pl, "_LOG_LAST_WARNING", None, raising=False)
+    if failure == "chmod":
+        def fail_chmod(*args, **kwargs):
+            raise PermissionError("chmod denied")
+        monkeypatch.setattr(os, "chmod", fail_chmod)
+    else:
+        fdopen = os.fdopen
+
+        class FullDisk:
+            def __init__(self, fh):
+                self.fh = fh
+
+            def __enter__(self):
+                self.fh.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self.fh.__exit__(*args)
+
+            def fileno(self):
+                return self.fh.fileno()
+
+            def write(self, data):
+                raise OSError("disk full")
+
+        monkeypatch.setattr(os, "fdopen", lambda *a, **kw: FullDisk(fdopen(*a, **kw)))
+
+    caplog.set_level(logging.WARNING, logger=pl.logger.name)
+    pl._log({"task_excerpt": "SECRET_PROMPT_CANARY"})
+    pl._log({"task_excerpt": "SECRET_PROMPT_CANARY"})
+    assert pl._LOG_FAILURES == 2
+    warnings = [r.getMessage() for r in caplog.records if r.name == pl.logger.name]
+    assert len(warnings) == 1 and str(log) in warnings[0]
+    assert "SECRET_PROMPT_CANARY" not in warnings[0]
+    assert not log.exists() or not log.read_text()
+
+
+def test_existing_log_is_not_written_when_hardening_fails(monkeypatch, tmp_path, caplog):
+    log = tmp_path / "jev" / "routing.jsonl"
+    log.parent.mkdir()
+    log.write_text("old row\n")
+    log.chmod(0o644)
+    monkeypatch.setattr(pl, "LOG_PATH", str(log))
+    monkeypatch.setattr(pl, "_LOG_FAILURES", 0)
+    monkeypatch.setattr(pl, "_LOG_LAST_WARNING", None)
+
+    def fail_fchmod(*args):
+        raise PermissionError("fchmod denied")
+
+    monkeypatch.setattr(os, "fchmod", fail_fchmod)
+    caplog.set_level(logging.WARNING, logger=pl.logger.name)
+    pl._log({"task_excerpt": "SECRET_PROMPT_CANARY"})
+    assert log.read_text() == "old row\n"
+    assert pl._LOG_FAILURES == 1
+    assert any(str(log) in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.skipif(not hasattr(os, "O_NOFOLLOW"), reason="requires O_NOFOLLOW")
+def test_log_refuses_preexisting_symlink(monkeypatch, tmp_path, caplog):
+    log = tmp_path / "jev" / "routing.jsonl"
+    log.parent.mkdir(mode=0o777)
+    victim = tmp_path / "victim"
+    victim.write_text("original\n")
+    victim.chmod(0o644)
+    log.symlink_to(victim)
+    monkeypatch.setattr(pl, "LOG_PATH", str(log))
+    monkeypatch.setattr(pl, "_LOG_FAILURES", 0)
+    monkeypatch.setattr(pl, "_LOG_LAST_WARNING", None)
+    caplog.set_level(logging.WARNING, logger=pl.logger.name)
+    pl._log({"task_excerpt": "SECRET_PROMPT_CANARY"})
+    assert victim.read_text() == "original\n"
+    assert stat.S_IMODE(victim.stat().st_mode) == 0o644
+    assert pl._LOG_FAILURES == 1
+    assert any(str(log) in r.getMessage() for r in caplog.records)
+
+
 def test_classify_passes_retries_zero_and_timeout(monkeypatch):
     """The routing call is bounded and un-retried."""
     seen = {}
@@ -643,6 +759,31 @@ def _err_kwargs(model, status, session="s1", reason="rate_limit"):
     return {"status_code": status, "reason": reason, "session_id": session,
             "turn_id": "e1", "provider": "nous",
             "api_kwargs": {"body": {"model": model, "messages": []}}}
+
+
+@pytest.mark.parametrize("status", [401, 404, 429])
+def test_error_hook_arms_from_host_request_envelope(monkeypatch, status):
+    recs = []
+    monkeypatch.setattr(pl, "_load_config", lambda: _cfg7())
+    monkeypatch.setattr(pl, "_log", recs.append)
+    _reset_decisions()
+    pl.on_api_request_error(
+        status_code=status, reason="provider_error", session_id="host-session",
+        turn_id="e1", provider="nous", model=_SONNET,
+        request={"method": "POST", "body": {"model": _LING, "messages": []}})
+    assert pl._session_override("host-session") == _FLASH
+    assert recs[-1]["model"] == _LING
+    assert recs[-1]["error_status"] == status
+
+
+def test_error_hook_falls_back_to_top_level_model(monkeypatch):
+    monkeypatch.setattr(pl, "_load_config", lambda: _cfg7())
+    monkeypatch.setattr(pl, "_log", lambda rec: None)
+    _reset_decisions()
+    pl.on_api_request_error(status_code=429, session_id="host-session",
+                            provider="nous", model=_LING,
+                            request={"method": "POST", "body": {}})
+    assert pl._session_override("host-session") == _FLASH
 
 
 @pytest.mark.parametrize("status", [401, 404, 429])
