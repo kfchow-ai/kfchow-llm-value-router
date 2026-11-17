@@ -77,12 +77,16 @@ config_schema:
     description: "Before escalating on a metered provider, probe the paid lane; fail-closed when dark."
   send_excerpt:
     type: bool
-    default: true
-    description: "Send a capped last-user-message excerpt to the vendor and include it in the local log. Set false to keep task text out of both (reduces accuracy)."
+    default: false
+    description: "Opt in to send a capped last-message excerpt to the classifier and local log; false sends shape only, which may reduce accuracy."
   excerpt_chars:
     type: int
     default: 1200
-    description: "Cap for the task excerpt (last user message)."
+    description: "Cap for the task excerpt (last message)."
+  classifier_spend_cap_usd:
+    type: float
+    default: 0.01
+    description: "Per-session classifier spend threshold in USD, configured in lane2_config.json. At or above the cap, skip classification and keep the current model. Zero disables calls; one admitted call may exceed the cap."
   jev_timeout_s:
     type: float
     default: 10

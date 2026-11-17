@@ -239,7 +239,7 @@ def test_rung_falls_back_to_flat_key():
 
 def test_features_are_content_free_shape_only():
     f = pl._features({"messages": [{"role": "user", "content": "def foo(): pass"}],
-                      "tools": [{"x": 1}, {"y": 2}]})
+                      "tools": [{"x": 1}, {"y": 2}]}, include_excerpt=True)
     assert f["n_tools"] == 2
     assert f["has_code"] is True
     # shape fields stay content-free; the excerpt is the ONE deliberate exception
@@ -249,7 +249,7 @@ def test_features_are_content_free_shape_only():
 
 def test_excerpt_is_capped():
     f = pl._features({"messages": [{"role": "user", "content": "x" * 5000}]},
-                     excerpt_chars=1200)
+                     excerpt_chars=1200, include_excerpt=True)
     assert len(f["task_excerpt"]) == 1200
 
 
@@ -299,15 +299,11 @@ def test_send_excerpt_true_includes_excerpt_in_log(monkeypatch):
     assert recs and recs[-1]["features"].get("task_excerpt") == "VISIBLETEXT"
 
 
-def test_send_excerpt_defaults_true_in_code_defaults():
-    # The DEFAULT config (no config file present) must default send_excerpt to True.
-    orig = pl.CONFIG_PATH
-    pl.CONFIG_PATH = "/nonexistent/config-path.json"
-    try:
-        cfg = pl._load_config()
-        assert cfg["send_excerpt"] is True
-    finally:
-        pl.CONFIG_PATH = orig
+def test_send_excerpt_defaults_false_in_code_defaults(monkeypatch, tmp_path):
+    # A missing config must not opt the user into sharing text.
+    monkeypatch.setattr(pl, "CONFIG_PATH", str(tmp_path / "missing.json"))
+    monkeypatch.setattr(pl, "_PLUGIN_CTX", None)
+    assert pl._load_config()["send_excerpt"] is False
 
 
 # --------------------------------------------------------------- core routing
